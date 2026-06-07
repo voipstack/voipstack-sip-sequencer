@@ -197,11 +197,16 @@ Artifacts: [`Makefile`](Makefile), [`packaging/systemd/voipstack-sip-sequencer.s
 [`packaging/nfpm.yaml`](packaging/nfpm.yaml). Full guide:
 [packaging/README.md](packaging/README.md).
 
-## Scope (v1)
+## Scope & Limitations (v1)
 
-Plain SIP + RTP only (no TLS/SRTP). Static linear sequence — no branching, looping, or
-dynamic routing. No transcoding, mixing, or audio injection. Single PBX / single
-sequence per instance. See [PRD.md §8](PRD.md) for the full non-goals list.
+Current constraints and features not yet supported. See [PRD.md §8](PRD.md) for the full non-goals list.
+
+- **Transport:** UDP only. No TCP, TLS, or WebSocket.
+- **Media security:** Plain RTP only. No SIPS, SIP over TLS, or SRTP.
+- **NAT traversal:** No STUN, TURN, ICE, or hole-punching for SIP or RTP.
+- **Sequencing:** Static linear sequence only. No branching, looping, or dynamic routing.
+- **Media processing:** No transcoding, mixing, or audio injection.
+- **Topology:** Single PBX / single sequence per instance.
 
 ## License
 
