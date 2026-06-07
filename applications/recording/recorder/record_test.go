@@ -19,7 +19,7 @@ import (
 type fakeUAC struct {
 	dcc  *sipgo.DialogClientCache
 	addr string
-	l    net.PacketConn
+	l    net.Listener
 }
 
 func newFakeUAC(t *testing.T) *fakeUAC {
@@ -32,11 +32,11 @@ func newFakeUAC(t *testing.T) *fakeUAC {
 	if err != nil {
 		t.Fatalf("fakeUAC client: %v", err)
 	}
-	l, err := net.ListenPacket("udp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("fakeUAC listen: %v", err)
 	}
-	addr := l.LocalAddr().String()
+	addr := l.Addr().String()
 	host, portStr, _ := net.SplitHostPort(addr)
 	port, _ := strconv.Atoi(portStr)
 	contact := sip.ContactHeader{Address: sip.Uri{Host: host, Port: port}}
@@ -50,17 +50,20 @@ func (f *fakeUAC) invite(ctx context.Context, target string, offer []byte, extra
 	if err := sip.ParseUri(target, &targetURI); err != nil {
 		return nil, err
 	}
+	params := targetURI.UriParams.Clone()
+	params.Add("transport", "tcp")
+	targetURI.UriParams = params
 	return f.dcc.Invite(ctx, targetURI, offer, extraHeaders...)
 }
 
 // startRecorder starts Serve in a background goroutine and returns its listen address.
 func startRecorder(t *testing.T, dir string) string {
 	t.Helper()
-	l, err := net.ListenPacket("udp", "127.0.0.1:0")
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("reserve port: %v", err)
 	}
-	addr := l.LocalAddr().String()
+	addr := l.Addr().String()
 	l.Close()
 
 	cfg := Config{

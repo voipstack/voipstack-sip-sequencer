@@ -14,7 +14,11 @@
 > - **Failure:** pass an app reject status (non-2xx final) straight through to the
 >   endpoint; on app timeout/unreachable send `503`. Always fail the whole call on app
 >   failure (per-app skip/abort policy is story 004).
-> - **Transport:** UDP only. TCP/TLS out of scope.
+> - **Transport:** Inbound SIP listener is UDP. **Application legs always use TCP**
+>   (the INVITE carries the caller's SDP which can exceed sipgo's UDP MTU guard ~1300 B);
+>   the engine forces `;transport=tcp` on the app recipient URI via a pure `withTCP` helper
+>   in `bridge.go` before calling `Invite`. The PBX (next-hop) leg uses sipgo's default
+>   (UDP unless the `next_hop` URI carries `;transport=tcp`). TLS out of scope.
 > - **Header transparency (both directions):** the B2BUA relays **every** header it does not
 >   own across the bridge verbatim — not just identity. On the **request** path each outbound
 >   leg (app + PBX) copies all inbound-INVITE headers (`From`/`To`, `Authorization`,
@@ -164,7 +168,8 @@ Conservative-design notes:
 1. **SIP stack & B2BUA primitives:**
    - Add `github.com/emiago/sipgo` (pin a released version) and `go get` it.
    - Build one `sipgo.UA` + a `sipgo.Server` (inbound UAS) and `sipgo.Client` (outbound
-     UAC) over **UDP** bound to `cfg.SIP.Listen`. Use sipgo's **dialog** layer:
+     UAC). Inbound listener bound to `cfg.SIP.Listen` over **UDP**; application outbound
+     legs always use **TCP** (engine-forced). Use sipgo's **dialog** layer:
      `DialogUA`/`DialogServer` for the inbound session, `DialogClient` for each outbound
      leg. Let sipgo own CSeq/tags/routing — do not hand-roll transactions.
    - Register an INVITE handler that drives the bridge; register BYE handling via the
@@ -277,15 +282,15 @@ Conservative-design notes:
    - `Engine struct { cfg config.Config; ua *sipgo.UA; srv *sipgo.Server;
      cli *sipgo.Client; dialogSrv *sipgo.DialogServer (or DialogUA); calls *Registry }`
    - `New(cfg config.Config) (*Engine, error)`: construct UA, server, client bound to
-     `cfg.SIP.Listen` over UDP; build the dialog layer; init `Registry`. Wrap errors `%w`.
+     `cfg.SIP.Listen`; build the dialog layer; init `Registry`. Wrap errors `%w`.
 3. Methods:
    - `Run(ctx context.Context) error`:
      - Register INVITE handler → `handleInvite`.
      - Register BYE/dialog termination handling so an inbound or leg BYE triggers teardown.
-     - Start listening on UDP `cfg.SIP.Listen`; block until `ctx` is cancelled.
+     - Start listening on **UDP** `cfg.SIP.Listen`; block until `ctx` is cancelled.
    - `Shutdown() error`: cancel run context; tear down all active calls; close
      server/client/UA; assert registry drains to 0.
-4. Constraints: no global state; UA/registry owned here; UDP only.
+4. Constraints: no global state; UA/registry owned here; inbound listener UDP; app legs TCP (engine-forced).
 
 ### Create type - Registry (registry.go)
 1. Responsibility: track active calls; the single owner of call state.
@@ -316,8 +321,10 @@ Conservative-design notes:
    - **Identity propagation (both legs):** pass the cloned `From`/`To` and pass-through
      headers when originating the UAC INVITE; do not let the UAC synthesize them. Leave
      `Contact`/`Via`/`Call-ID`/`CSeq`/`Max-Forwards` to sipgo (sequencer-owned).
-   - **App leg:** originate UAC INVITE to `cfg.Sequence[0].URI` with the endpoint offer SDP
-     (opaque) and the propagated identity. Relay app 18x → endpoint 18x.
+   - **App leg:** parse `cfg.Sequence[0].URI`, force `;transport=tcp` via pure helper
+     `withTCP(u sip.Uri) sip.Uri` (clones URI params, calls `UriParams.Add("transport","tcp")`
+     — overrides any operator value). Originate UAC INVITE to the TCP-forced URI with the
+     endpoint offer SDP (opaque) and the propagated identity. Relay app 18x → endpoint 18x.
      - 2xx → store app answer SDP.
      - non-2xx final → respond to endpoint with the **same status code**; `teardown`; return.
      - timeout/transport error → respond `503` to endpoint; `teardown`; return.
@@ -332,12 +339,15 @@ Conservative-design notes:
    `mapFailureStatus`; always followed by teardown so no partial call survives.
 4. Completion: AC1–AC5 pass against fakes; no goroutine/dialog leak after the call ends.
 
-### Implement pure helpers (state.go)
+### Implement pure helpers (state.go, bridge.go)
 1. `mapFailureStatus(kind failureKind, appStatus int) int` — reject ⇒ `appStatus`;
    timeout/transport ⇒ `503`. Pure, table-tested.
 2. `canTransition(from, to CallState) bool` and `next(...)` — guard legal lifecycle moves;
    make teardown idempotent. Pure.
-3. Constraints: no sipgo imports; deterministic; unit tests target these directly.
+3. `withTCP(u sip.Uri) sip.Uri` (in `bridge.go`) — clones URI params, sets/overwrites
+   `transport=tcp`. Returns new value; does not mutate argument. Pure, unit-tested via
+   `TestWithTCPForcesTransport`.
+4. Constraints: no I/O; deterministic; unit tests target these directly.
 
 ### Update edge - cmd/sip-sequencer/main.go
 1. Responsibility: run the engine instead of printing the placeholder line.
@@ -349,11 +359,18 @@ Conservative-design notes:
 
 ### Create test harness + behavior tests (b2bua_test.go, testsupport)
 1. Responsibility: real in-memory SIP fakes (no internal mocks).
-2. Provide sipgo-based loopback helpers: `fakeCaller` (UAC that INVITEs the engine with a
-   known `From`/`To`), `fakeApp` (UAS: answers 2xx with SDP, or rejects with a configurable
-   status, or never answers), `fakePBX` (UAS: answers/rejects). The `fakeApp`/`fakePBX`
-   capture the `From`/`To` (and chosen pass-through headers) of the INVITE they receive so
-   tests can assert identity transparency. Bind on `127.0.0.1:0` (ephemeral) over UDP.
+2. Provide sipgo-based loopback helpers:
+   - `fakeUAC` (UAC that INVITEs the engine with a known `From`/`To`)
+   - `fakeUAS` (`b2bua_test.go`) — general UAS; binds `127.0.0.1:0` ephemeral and serves
+     **both UDP and TCP** on the same port (`srv.ServeUDP` + `srv.ServeTCP`). Covers the
+     app role (reached over TCP by the engine) and the PBX role (reached over UDP).
+   - `newFakeUASTCP` (`transport_test.go`) — TCP-only UAS (no UDP listener) used to
+     prove the engine forces TCP on app legs; a UDP datagram to this fake is silently
+     dropped, so `TestAppInviteUsesTCP` fails immediately if transport is wrong.
+   - `fakePBXSimple` / `fakeUACSimple` (proxy_test.go) — non-dialog helpers for
+     unmanaged-method passthrough tests; UDP only (PBX role, unchanged).
+   - `fakeApp`/`fakePBX` capture the `From`/`To` of the INVITE they receive so tests can
+     assert identity transparency.
 3. Behavior tests (Given/When/Then, named by behavior):
    - `TestSingleAppCallConnectsEndToEnd` (AC1)
    - `TestCallerHangupTearsDownAllLegs` (AC2)
@@ -362,11 +379,13 @@ Conservative-design notes:
      never invited)
    - `TestAppTimeoutReturns503` (AC4 timeout branch)
    - `TestInboundAndOutboundAreDistinctDialogs` (AC5 — assert different Call-IDs/tags)
-   - `TestPbxLegPreservesInboundFromTo` (identity transparency — `fakePBX` sees the caller's
-     `From`/`To`, not synthesized values; `Contact`/`Call-ID` are the sequencer's)
-   - `TestAppLegPreservesInboundFromTo` (identity transparency — `fakeApp` sees the caller's
-     `From`/`To`)
+   - `TestPbxLegPreservesInboundFromTo` (identity transparency)
+   - `TestAppLegPreservesInboundFromTo` (identity transparency)
    - `TestManyRejectedCallsLeaveNoActiveCalls` (no-leak NFR — registry.len()==0 after)
+   - `TestAppInviteUsesTCP` (`transport_test.go`) — app fake is TCP-only; proves engine
+     forces TCP regardless of URI transport param; call connects end-to-end, PBX stays UDP.
+   - `TestWithTCPForcesTransport` — unit test for `withTCP` pure helper; verifies both bare
+     URI and `transport=udp` URI get overridden to `transport=tcp`.
 4. Completion: all pass under `go test -race ./...`.
 
 ## Norms
@@ -380,8 +399,9 @@ Conservative-design notes:
 3. **Errors as values:** wrap with `%w` + context (`"originate app leg %q: %w"`). The
    bridge maps errors to SIP responses (pass-through status / 503) and triggers teardown.
    No `panic` on network input; never `os.Exit` outside `main`.
-4. **SIP specifics:** use sipgo dialog sessions for CSeq/tag/route bookkeeping; UDP
-   transport; relay SDP bodies opaquely (never parse). Inbound 200 OK only after PBX 2xx.
+4. **SIP specifics:** use sipgo dialog sessions for CSeq/tag/route bookkeeping. Inbound
+   listener is UDP; app legs always TCP (engine-forced via `withTCP`); PBX leg UDP default.
+   Relay SDP bodies opaquely (never parse). Inbound 200 OK only after PBX 2xx.
    **Identity transparency:** outbound legs carry the inbound `From`/`To` + caller
    pass-through headers verbatim; only `Contact`/`Via`/`Call-ID`/`CSeq`/`Max-Forwards` (and,
    from story 005, SDP media) are sequencer-owned. Supply `From`/`To` explicitly so the UAC
@@ -417,7 +437,10 @@ Conservative-design notes:
    this story; audio correctness is **not** asserted (story 005). No SDP parsing/rewriting.
 5. **Answer-timing constraint:** the endpoint 200 OK is sent **only after** the PBX leg
    returns 2xx, carrying the PBX answer SDP; 18x is relayed upstream before then.
-6. **Transport constraint:** listener and outbound legs use **UDP** only; no TCP/TLS.
+6. **Transport constraint:** inbound SIP listener is **UDP**. Application legs **always TCP**
+   (engine forces `;transport=tcp` via `withTCP` — not operator-configurable, cannot be
+   overridden by config). PBX (next-hop) leg is **UDP by default**; operator may add
+   `;transport=tcp` to the `next_hop` URI to opt into TCP. No TLS.
 7. **Concurrency/perf constraints:** `-race` clean; ≥ tens of concurrent calls without data
    races (toward the PRD 100-call target, fully verified in story 008/perf); per-call setup
    adds at most the app+PBX round trips — imperceptible for one app (NFR, sanity-check not a

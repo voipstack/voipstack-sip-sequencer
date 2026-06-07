@@ -18,7 +18,7 @@ import (
 
 // Config holds runtime parameters for the recording application.
 type Config struct {
-	Listen    string // SIP UDP listen address, e.g. "0.0.0.0:5070"
+	Listen    string // SIP TCP listen address, e.g. "0.0.0.0:5070"
 	Dir       string // root folder; per-call sub-folders are created here
 	MediaHost string // IP advertised in SDP answers and rtpdump headers
 }
@@ -115,7 +115,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		_ = tx.Respond(res)
 	})
 
-	l, err := net.ListenPacket("udp", cfg.Listen)
+	l, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("recorder listen %s: %w", cfg.Listen, err)
 	}
@@ -129,7 +129,7 @@ func Serve(ctx context.Context, cfg Config) error {
 		l.Close()
 	}()
 
-	err = srv.ServeUDP(l)
+	err = srv.ServeTCP(l)
 	slog.Info("recorder stopped")
 	return err
 }

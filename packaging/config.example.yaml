@@ -5,15 +5,17 @@
 sip:
   listen: 0.0.0.0:5060        # SIP listener address:port (privileged :5060 needs CAP_NET_BIND_SERVICE)
 
-next_hop: pbx.internal:5060   # downstream PBX the call is forwarded to after the sequence
+next_hop: pbx.internal:5060   # downstream PBX (UDP by default; append ;transport=tcp to the URI to use TCP)
 
 rtp:
   port_range: 10000-20000     # UDP port range the anchored RTP sessions allocate from
 
 # Ordered chain of external SIP applications each call is sequenced through.
+# Application legs always use TCP (the offer carries the caller's SDP, which can
+# exceed the UDP MTU guard); no transport param is needed on the uri.
 sequence:
   - name: transcription       # human-readable id for logs/metrics
-    uri: sip:asr@127.0.0.1:6060  # the application server's SIP URI
+    uri: sip:asr@127.0.0.1:6060  # the application server's SIP URI (reached over TCP)
     media: tap                # tap = fork both directions to the app; none = inactive audio
     on_failure: skip          # skip = continue the chain on failure; abort = drop the call
 
