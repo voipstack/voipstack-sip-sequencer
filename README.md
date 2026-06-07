@@ -197,6 +197,72 @@ Artifacts: [`Makefile`](Makefile), [`packaging/systemd/voipstack-sip-sequencer.s
 [`packaging/nfpm.yaml`](packaging/nfpm.yaml). Full guide:
 [packaging/README.md](packaging/README.md).
 
+## Quick Start: Side-by-side with FreeSWITCH
+
+Deploy on the **same host or container** as your PBX (e.g. FreeSWITCH) so you can add applications without changing any PBX configuration.
+
+### Goal
+
+- FreeSWITCH keeps listening on its usual profile port (e.g. `5060`).
+- The sequencer listens on a new port on the **same IP** (e.g. `5080`).
+- Endpoints send calls to the sequencer on `5080`.
+- The sequencer chains applications, then forwards to FreeSWITCH on `5060`.
+
+### 1. Install
+
+Install the released `.deb`:
+
+```sh
+sudo dpkg -i voipstack-sip-sequencer_1.2.3_amd64.deb
+```
+
+This installs the binary, systemd unit, and a sample config at `/etc/voipstack-sip-sequencer/config.yaml`. The config is a `dpkg` **conffile** — your edits survive upgrades.
+
+### 2. Configure
+
+Edit `/etc/voipstack-sip-sequencer/config.yaml`. Use the **same IP** as the FreeSWITCH profile you want to route to, but a **different port** for the sequencer and a **non-overlapping RTP range**:
+
+```yaml
+sip:
+  listen: 192.168.1.10:5080      # same interface as FreeSWITCH, different port
+
+next_hop: 192.168.1.10:5060     # FreeSWITCH's internal profile (UDP)
+
+rtp:
+  port_range: 30000-30100        # must not overlap with FreeSWITCH's range
+
+sequence:
+  - name: transcriber
+    uri: sip:transcriber.internal:5060
+    on_failure: skip
+    media: tap
+
+observability:
+  listen: 0.0.0.0:9090
+
+log_level: info
+```
+
+### 3. Start
+
+```sh
+sudo systemctl start voipstack-sip-sequencer
+```
+
+### 4. Route your UAC to the sequencer
+
+Point your endpoint/trunk SIP server from `192.168.1.10:5060` to `192.168.1.10:5080`.
+
+Call flow becomes:
+
+```
+Endpoint ─► Sequencer (5080) ─► Transcriber ─► Sequencer ─► FreeSWITCH (5060)
+```
+
+### 5. Rollback
+
+If you ever want to bypass the sequencer, point the UAC back to `:5060`. FreeSWITCH was never reconfigured, so it continues working exactly as before.
+
 ## Scope & Limitations (v1)
 
 Current constraints and features not yet supported. See [PRD.md §8](PRD.md) for the full non-goals list.
