@@ -210,7 +210,7 @@ Deploy on the **same host or container** as your PBX (e.g. FreeSWITCH) so you ca
 
 ### 1. Install
 
-Install the released `.deb`:
+Download the latest `.deb` from [GitHub Releases](https://github.com/voipstack/voipstack-sip-sequencer/releases):
 
 ```sh
 sudo dpkg -i voipstack-sip-sequencer_1.2.3_amd64.deb
