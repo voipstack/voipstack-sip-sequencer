@@ -1,0 +1,23 @@
+# Example operator config for voipstack-sip-sequencer.
+# Copy to /etc/voipstack-sip-sequencer/config.yaml and edit for your host.
+# Only the keys below are recognised; unknown keys are rejected at load time.
+
+sip:
+  listen: 0.0.0.0:5060        # SIP listener address:port (privileged :5060 needs CAP_NET_BIND_SERVICE)
+
+next_hop: pbx.internal:5060   # downstream PBX the call is forwarded to after the sequence
+
+rtp:
+  port_range: 10000-20000     # UDP port range the anchored RTP sessions allocate from
+
+# Ordered chain of external SIP applications each call is sequenced through.
+sequence:
+  - name: transcription       # human-readable id for logs/metrics
+    uri: sip:asr@127.0.0.1:6060  # the application server's SIP URI
+    media: tap                # tap = fork both directions to the app; none = inactive audio
+    on_failure: skip          # skip = continue the chain on failure; abort = drop the call
+
+observability:
+  listen: 0.0.0.0:9090        # optional /health + /metrics HTTP listener; empty/omit to disable
+
+log_level: info               # debug | info | warn | error

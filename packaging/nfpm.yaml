@@ -1,0 +1,39 @@
+# nfpm manifest for the voipstack-sip-sequencer Debian package.
+# Built by `make deb` (which exports VERSION). nfpm expands ${VERSION} from the env.
+# Reuses the same binary, unit, and example config as the manual install — no extra payload.
+name: voipstack-sip-sequencer
+arch: amd64
+platform: linux
+version: ${VERSION}
+version_schema: none
+section: net
+priority: optional
+maintainer: bit4bit <jovany@bit4bit.in>
+description: |
+  SIP application sequencer (B2BUA) that chains each call through an ordered
+  sequence of independent external SIP application servers, anchoring RTP.
+homepage: https://github.com/voipstack/voipstack-sip-sequencer
+license: GPL-3.0
+
+contents:
+  - src: dist/sip-sequencer
+    dst: /usr/bin/sip-sequencer
+    file_info:
+      mode: 0755
+
+  - src: packaging/systemd/voipstack-sip-sequencer.service
+    dst: /lib/systemd/system/voipstack-sip-sequencer.service
+    file_info:
+      mode: 0644
+
+  # Seeded operator config. type:config makes it a dpkg conffile so edits survive upgrades.
+  - src: packaging/config.example.yaml
+    dst: /etc/voipstack-sip-sequencer/config.yaml
+    type: config
+    file_info:
+      mode: 0640
+
+scripts:
+  postinstall: packaging/debian/postinst
+  preremove: packaging/debian/prerm
+  postremove: packaging/debian/postrm

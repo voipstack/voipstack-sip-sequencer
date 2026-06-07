@@ -1,0 +1,23 @@
+#!/bin/sh
+# postinst — register the service after install/upgrade.
+# Reload units and enable on boot. Do NOT start: the seeded config has a placeholder
+# next_hop; the operator edits /etc/voipstack-sip-sequencer/config.yaml then `systemctl
+# start`. A still-placeholder config fails loudly and visibly (AC4) — intended.
+set -e
+
+UNIT=voipstack-sip-sequencer.service
+
+case "$1" in
+  configure)
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      if command -v deb-systemd-helper >/dev/null 2>&1; then
+        deb-systemd-helper enable "$UNIT" >/dev/null 2>&1 || true
+      else
+        systemctl enable "$UNIT" >/dev/null 2>&1 || true
+      fi
+    fi
+    ;;
+esac
+
+exit 0
