@@ -51,7 +51,11 @@ jobs:
             exit 0
           fi
 
-          # On main branch: maintain a rolling "latest" release
+          # On main branch: maintain a rolling "latest" release with a stable filename
+          NEW_DEB="dist/voipstack-sip-sequencer_latest_amd64.deb"
+          mv "$DEB_FILE" "$NEW_DEB"
+          DEB_FILE="$NEW_DEB"
+
           if gh release view latest &>/dev/null; then
             gh release edit latest --title "latest (${GITHUB_SHA:0:7})"
             gh release upload latest "$DEB_FILE" --clobber
