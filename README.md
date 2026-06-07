@@ -267,7 +267,7 @@ If you ever want to bypass the sequencer, point the UAC back to `:5060`. FreeSWI
 
 Current constraints and features not yet supported. See [PRD.md §8](PRD.md) for the full non-goals list.
 
-- **Transport:** UDP only. No TCP, TLS, or WebSocket.
+- **Transport:** Inbound listener is UDP. Application legs always use TCP (so large SDP offers are not capped by the UDP MTU guard); the next-hop leg is UDP by default and can opt into TCP via `;transport=tcp` on its URI. No TLS or WebSocket.
 - **Media security:** Plain RTP only. No SIPS, SIP over TLS, or SRTP.
 - **NAT traversal:** No STUN, TURN, ICE, or hole-punching for SIP or RTP.
 - **Sequencing:** Static linear sequence only. No branching, looping, or dynamic routing.

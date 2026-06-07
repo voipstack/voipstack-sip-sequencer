@@ -46,13 +46,20 @@ func newFakeUAS(t *testing.T) *fakeUAS {
 		t.Fatalf("fakeUAS client: %v", err)
 	}
 
+	// Serve both UDP and TCP on the same port: the app leg is always reached over
+	// TCP (engine-forced), the PBX leg over UDP, and the same fake fills both roles.
 	l, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("fakeUAS listen: %v", err)
+		t.Fatalf("fakeUAS listen udp: %v", err)
 	}
 	addr := l.LocalAddr().String()
 	host, portStr, _ := net.SplitHostPort(addr)
 	port, _ := strconv.Atoi(portStr)
+
+	tl, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("fakeUAS listen tcp: %v", err)
+	}
 
 	contact := sip.ContactHeader{Address: sip.Uri{Host: host, Port: port}}
 	dsc := sipgo.NewDialogServerCache(cli, contact)
@@ -92,8 +99,9 @@ func newFakeUAS(t *testing.T) *fakeUAS {
 		_ = tx.Respond(res)
 	})
 
-	go srv.ServeUDP(l) //nolint:errcheck
-	t.Cleanup(func() { l.Close() })
+	go srv.ServeUDP(l)  //nolint:errcheck
+	go srv.ServeTCP(tl) //nolint:errcheck
+	t.Cleanup(func() { l.Close(); tl.Close() })
 
 	return f
 }

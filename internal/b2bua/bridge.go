@@ -14,6 +14,15 @@ import (
 	"github.com/voipstack/voipstack-sip-sequencer/internal/config"
 )
 
+// withTCP returns u with its transport URI parameter forced to tcp, overriding any
+// existing value. It does not mutate u's params (the clone is fresh).
+func withTCP(u sip.Uri) sip.Uri {
+	params := u.UriParams.Clone()
+	params.Add("transport", "tcp")
+	u.UriParams = params
+	return u
+}
+
 // handleInvite is the INVITE handler. It accepts the inbound dialog, creates a
 // Call, and runs the bridge synchronously.
 //
@@ -88,6 +97,9 @@ func (e *Engine) bridge(ctx context.Context, call *Call) {
 			call.teardown("bad app URI")
 			return
 		}
+		// Application legs always run over TCP: the offer carries the caller's SDP
+		// (grown further in tap mode), which can exceed sipgo's UDP MTU guard.
+		appURI = withTCP(appURI)
 
 		// Build the INVITE body for this app based on its media mode.
 		var inviteBody []byte
