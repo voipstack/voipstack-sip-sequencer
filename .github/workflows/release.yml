@@ -1,0 +1,61 @@
+# Build and release .deb on every push to main (rolling "latest") and on every tag.
+name: release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install nfpm
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Build .deb
+        run: make deb
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          DEB_FILE=$(ls dist/*.deb | head -n1)
+          TAG="${GITHUB_REF_NAME}"
+
+          # Handle tag pushes: create/update a normal release
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            # Create release if it doesn't exist; ignore error if it does
+            gh release create "$TAG" "$DEB_FILE" --title "$TAG" --generate-notes || true
+            gh release upload "$TAG" "$DEB_FILE" --clobber
+            echo "Released $DEB_FILE to $TAG"
+            exit 0
+          fi
+
+          # On main branch: maintain a rolling "latest" release
+          if gh release view latest &>/dev/null; then
+            gh release edit latest --title "latest (${GITHUB_SHA:0:7})"
+            gh release upload latest "$DEB_FILE" --clobber
+          else
+            gh release create latest "$DEB_FILE" --title "latest" --generate-notes --latest=false
+          fi
+          echo "Released $DEB_FILE to latest"
