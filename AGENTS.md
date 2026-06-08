@@ -59,6 +59,10 @@ Corollaries:
   test, not as an external service to stub.
 - Prefer real fakes over assertion-heavy mocks: a small in-memory WebSocket/webhook
   server you can inspect beats a mock framework recording calls.
+## Commits: manual only
+- **Do not commit automatically.** Changes are left staged or unstaged for the user to review and commit. Only the user authorizes commits.
+- If a user explicitly requests a commit in a task prompt, write the commit message (or follow their message format) and ask for confirmation before running `git commit`.
+
 ## Go specifics
 - `gofmt` / `go vet` clean. Idiomatic Go.
 - Errors are values — return and handle them; wrap with context (`fmt.Errorf("...: %w")`).

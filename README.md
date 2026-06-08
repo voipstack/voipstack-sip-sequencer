@@ -11,6 +11,10 @@ inserts each application in turn.
 
 See [PRD.md](PRD.md) for the full product definition.
 
+## ⚠️ Status: Under Construction
+
+This project is **under active development** and should be used **at your own risk**. APIs, configuration, and behavior may change without notice. Do not use in production environments without thorough testing and validation.
+
 ## How it works
 
 ```
