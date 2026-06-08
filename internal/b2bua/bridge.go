@@ -105,18 +105,11 @@ func (e *Engine) bridge(ctx context.Context, call *Call) {
 	<-ctx.Done()
 }
 
-// fail sends a final response to the inbound caller and tears the call down.
-// Used in the PBX phase, after the media session owns the taps (teardown's
-// releaseMedia hook frees them via mediaSess.tapList).
+// fail sends a final response to the inbound caller, releases any taps stashed on
+// the call before the media session took ownership of them, and tears the call
+// down. Pending taps are only reachable here until dialPBX registers them on the
+// media session (success path), so every setup-phase failure must release them.
 func (e *Engine) fail(call *Call, status int, reason, cause string) {
-	_ = call.inbound.session.Respond(status, reason, nil)
-	call.teardown(cause)
-}
-
-// failPending is fail plus releasing taps stashed on the call before the media
-// session took ownership of them. Used in the app-chain and media-anchor phases,
-// where pending taps are not yet reachable from teardown's releaseMedia hook.
-func (e *Engine) failPending(call *Call, status int, reason, cause string) {
 	_ = call.inbound.session.Respond(status, reason, nil)
 	releasePendingTaps(call, e.ports)
 	call.teardown(cause)
@@ -190,7 +183,7 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 		var appURI sip.Uri
 		if err := sip.ParseUri(app.URI, &appURI); err != nil {
 			slog.Error("parse app URI", "uri", app.URI, "err", err)
-			e.failPending(call, 500, "Server Error", "bad app URI")
+			e.fail(call, 500, "Server Error", "bad app URI")
 			return false
 		}
 		// Application legs always run over TCP: the offer carries the caller's SDP
@@ -213,7 +206,7 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 					if errors.Is(err, errTapExhausted) {
 						status, reason = 503, "Service Unavailable"
 					}
-					e.failPending(call, status, reason, fmt.Sprintf("tap setup for %q: %v", app.Name, err))
+					e.fail(call, status, reason, fmt.Sprintf("tap setup for %q: %v", app.Name, err))
 					return false
 				}
 				continue
@@ -222,7 +215,7 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 			if err != nil {
 				tap.release(e.ports)
 				slog.Error("build tap offer", "name", app.Name, "err", err)
-				e.failPending(call, 500, "Server Error", fmt.Sprintf("build tap offer for %q: %v", app.Name, err))
+				e.fail(call, 500, "Server Error", fmt.Sprintf("build tap offer for %q: %v", app.Name, err))
 				return false
 			}
 		} else {
@@ -230,7 +223,7 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 			inviteBody, err = buildInactiveOffer(call.inbound.offerSDP, e.mediaHost)
 			if err != nil {
 				slog.Error("build inactive offer", "name", app.Name, "err", err)
-				e.failPending(call, 500, "Server Error", fmt.Sprintf("build inactive offer for %q: %v", app.Name, err))
+				e.fail(call, 500, "Server Error", fmt.Sprintf("build inactive offer for %q: %v", app.Name, err))
 				return false
 			}
 		}
@@ -247,7 +240,7 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 			e.metrics.AppFailure(app.Name)
 			slog.Warn("application failed", "name", app.Name, "uri", app.URI, "policy", app.OnFailure, "stage", "originate", "err", err)
 			if failureAction(app.OnFailure) == actionAbort {
-				e.failPending(call, 503, "Service Unavailable", fmt.Sprintf("app leg originate failed: %v", err))
+				e.fail(call, 503, "Service Unavailable", fmt.Sprintf("app leg originate failed: %v", err))
 				return false
 			}
 			continue
@@ -362,21 +355,21 @@ func (e *Engine) anchorMedia(call *Call) (mediaAnchor, bool) {
 	epHost, epPort, err := parseMedia(call.inbound.offerSDP)
 	if err != nil {
 		slog.Error("parse inbound SDP", "err", err)
-		e.failPending(call, 488, "Not Acceptable Here", "bad inbound SDP")
+		e.fail(call, 488, "Not Acceptable Here", "bad inbound SDP")
 		return mediaAnchor{}, false
 	}
 
 	epPair, err := e.ports.Acquire()
 	if err != nil {
 		slog.Error("acquire endpoint media ports", "err", err)
-		e.failPending(call, 503, "Service Unavailable", "port exhaustion")
+		e.fail(call, 503, "Service Unavailable", "port exhaustion")
 		return mediaAnchor{}, false
 	}
 	pbxPair, err := e.ports.Acquire()
 	if err != nil {
 		e.ports.Release(epPair)
 		slog.Error("acquire pbx media ports", "err", err)
-		e.failPending(call, 503, "Service Unavailable", "port exhaustion")
+		e.fail(call, 503, "Service Unavailable", "port exhaustion")
 		return mediaAnchor{}, false
 	}
 
@@ -385,7 +378,7 @@ func (e *Engine) anchorMedia(call *Call) (mediaAnchor, bool) {
 		e.ports.Release(epPair)
 		e.ports.Release(pbxPair)
 		slog.Error("bind endpoint media sockets", "err", err)
-		e.failPending(call, 500, "Server Error", "media bind failed")
+		e.fail(call, 500, "Server Error", "media bind failed")
 		return mediaAnchor{}, false
 	}
 	pbxSide, err := newAnchorSide(e.mediaHost, pbxPair)
@@ -394,7 +387,7 @@ func (e *Engine) anchorMedia(call *Call) (mediaAnchor, bool) {
 		e.ports.Release(epPair)
 		e.ports.Release(pbxPair)
 		slog.Error("bind pbx media sockets", "err", err)
-		e.failPending(call, 500, "Server Error", "media bind failed")
+		e.fail(call, 500, "Server Error", "media bind failed")
 		return mediaAnchor{}, false
 	}
 
@@ -484,6 +477,7 @@ func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, st
 		} else {
 			_ = call.inbound.session.Respond(mapFailureStatus(failureTimeout, 0), "Service Unavailable", nil)
 		}
+		releasePendingTaps(call, e.ports)
 		call.teardown(fmt.Sprintf("pbx leg failed: %v", pbxErr))
 		return false
 	}
@@ -529,6 +523,7 @@ func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, st
 	if err := call.inbound.session.Respond(200, "OK", epAnswerSDP,
 		relayableResponseHeaders(pbxResp, epAnswerSDP)...); err != nil {
 		slog.Error("answer endpoint", "err", err)
+		releasePendingTaps(call, e.ports)
 		call.teardown("answer endpoint failed")
 		return false
 	}

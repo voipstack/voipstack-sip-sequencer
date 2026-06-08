@@ -582,6 +582,64 @@ func TestForkPortsReleasedOnTeardown(t *testing.T) {
 	}
 }
 
+// Given a tap app whose tap is stashed (app answered 200); When the PBX leg fails
+// after the tap is stashed; Then the stashed tap's port pairs are released — the
+// allocator can hand out every pair again (no leak on PBX-phase failure, AC6).
+func TestForkPortsReleasedWhenPBXFails(t *testing.T) {
+	tapUAS := newFakeUAS(t)
+	pbxUAS := newFakeUAS(t)
+
+	listenAddr := freeAddr(t)
+	// 4 pairs: tap-caller, tap-callee, ep, pbx — exactly one tap call's worth.
+	cfg := config.Config{
+		SIP:     config.SIP{Listen: listenAddr},
+		NextHop: pbxUAS.sipURI(),
+		RTP:     config.RTP{PortRange: "17400-17408"},
+		Sequence: []config.Application{
+			{Name: "tapapp", URI: tapUAS.sipURI(), OnFailure: config.FailureSkip, Media: config.MediaTap},
+		},
+	}
+	eng := startEngine(t, cfg, 0)
+
+	s1, s2 := newTapReceivers(t)
+	autoAnswerTapWith(t, tapUAS, func() []byte {
+		return tapAnswerSDP(addrHost(s1.LocalAddr()), addrPort(t, s1.LocalAddr()), addrPort(t, s2.LocalAddr()))
+	})
+	// PBX rejects: the tap is already stashed when this fails the call.
+	autoReject(t, pbxUAS, 503, "Service Unavailable")
+
+	ctx := context.Background()
+	epConn, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	defer epConn.Close()
+	t.Cleanup(func() { epConn.Close() })
+
+	caller := newFakeUAC(t)
+	sess, err := caller.invite(ctx, "sip:"+listenAddr,
+		sdpWithAddr(addrHost(epConn.LocalAddr()), addrPort(t, epConn.LocalAddr())))
+	if err != nil {
+		t.Fatalf("invite: %v", err)
+	}
+	if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err == nil {
+		t.Fatal("expected call failure (PBX rejects), got 200")
+	}
+
+	// Let teardown release media + pending-tap ports.
+	time.Sleep(200 * time.Millisecond)
+
+	// All 4 pairs must be acquirable again; a leak would lose the 2 tap pairs.
+	var acquired []PortPair
+	for {
+		p, err := eng.ports.Acquire()
+		if err != nil {
+			break
+		}
+		acquired = append(acquired, p)
+	}
+	if len(acquired) != 4 {
+		t.Fatalf("acquirable pairs = %d, want 4 (tap pairs leaked on PBX failure)", len(acquired))
+	}
+}
+
 // Given sequence with two tap apps; When call established; Then each app independently
 // receives both call directions (D6).
 func TestMultipleTapAppsEachReceiveBothDirections(t *testing.T) {

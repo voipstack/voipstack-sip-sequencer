@@ -47,6 +47,11 @@ Corollaries:
 - A test must be able to fail for a real reason. If it can't, delete it.
 - Cover edge cases that matter: re-INVITE, hold/resume, REFER re-point, fork failure
   (best-effort, must not affect the call).
+## Bug fixes: reproduce → test → fix
+- A bug is not fixed until it is **reproduced by a test**. Write a test that fails and exposes the bug.
+- Fix the code to make the test pass.
+- The fix is not complete until the test has coverage and validates the behavior.
+- No "I think this fixes it" fixes without proof via a test.
 ## Mocking: mock only external services
 - **Do NOT mock internal code.** Internal functions, types, and packages are tested
   through their real implementations. If internal code is hard to test without mocks,
