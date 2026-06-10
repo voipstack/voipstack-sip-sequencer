@@ -33,6 +33,8 @@ type Engine struct {
 	metrics        MetricsSink
 	tlsProvider    tlsprov.Provider
 	tlsServerConf  *tls.Config
+	tlsDialers     map[string]*sipgo.DialogClientCache
+	tlsUAs         []*sipgo.UserAgent
 	runCtx         context.Context
 	runCancel      context.CancelFunc
 	legTimeout     time.Duration
@@ -102,6 +104,7 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 		dialogCliCache: sipgo.NewDialogClientCache(cli, contactHDR),
 		calls:          &Registry{m: make(map[string]*Call), byDialog: make(map[string]*Call)},
 		metrics:        noopMetrics{},
+		tlsDialers:     map[string]*sipgo.DialogClientCache{},
 		legTimeout:     32 * time.Second,
 		ports:          newPortAllocator(portMin, portMax),
 		mediaHost:      host,
@@ -125,6 +128,52 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 			return nil, fmt.Errorf("build tls server context: %w", err)
 		}
 		e.tlsServerConf = conf
+	}
+
+	// Build one outbound TLS dialer per distinct profile. sipgo binds the outbound
+	// *tls.Config at the UserAgent (not per request), so each profile needs its own
+	// UA+Client+DialogClientCache. Endpoints naming the same profile share one dialer,
+	// hence one loaded certificate. A bad client context aborts startup (fail-fast).
+	outbound := map[string]*config.ResolvedTLSProfile{}
+	firstEndpoint := ""
+	for i := range cfg.Sequence {
+		app := cfg.Sequence[i]
+		if app.Transport != config.TransportTLS || app.Resolved == nil {
+			continue
+		}
+		if _, ok := outbound[app.Resolved.Name]; !ok {
+			outbound[app.Resolved.Name] = app.Resolved
+			if firstEndpoint == "" {
+				firstEndpoint = fmt.Sprintf("sequence[%d] %q", i, app.Name)
+			}
+		}
+	}
+	if cfg.NextHop.Transport == config.TransportTLS && cfg.NextHop.Resolved != nil {
+		if _, ok := outbound[cfg.NextHop.Resolved.Name]; !ok {
+			outbound[cfg.NextHop.Resolved.Name] = cfg.NextHop.Resolved
+			if firstEndpoint == "" {
+				firstEndpoint = "next_hop"
+			}
+		}
+	}
+	if len(outbound) > 0 && e.tlsProvider == nil {
+		return nil, fmt.Errorf("%s uses transport tls but no TLS provider", firstEndpoint)
+	}
+	for name, rp := range outbound {
+		conf, err := e.tlsProvider.ClientConfig(*rp)
+		if err != nil {
+			return nil, fmt.Errorf("build tls client context for profile %q: %w", name, err)
+		}
+		tlsUA, err := sipgo.NewUA(sipgo.WithUserAgenTLSConfig(conf))
+		if err != nil {
+			return nil, fmt.Errorf("create TLS UA for profile %q: %w", name, err)
+		}
+		tlsCli, err := sipgo.NewClient(tlsUA, sipgo.WithClientHostname(host))
+		if err != nil {
+			return nil, fmt.Errorf("create TLS client for profile %q: %w", name, err)
+		}
+		e.tlsDialers[name] = sipgo.NewDialogClientCache(tlsCli, contactHDR)
+		e.tlsUAs = append(e.tlsUAs, tlsUA)
 	}
 
 	return e, nil
@@ -276,6 +325,9 @@ func (e *Engine) Shutdown() error {
 	})
 	if e.runCancel != nil {
 		e.runCancel()
+	}
+	for _, ua := range e.tlsUAs {
+		_ = ua.Close()
 	}
 	return e.srv.Close()
 }
