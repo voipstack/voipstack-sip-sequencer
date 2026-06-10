@@ -5,7 +5,9 @@
 sip:
   listen: 0.0.0.0:5060        # SIP listener address:port (privileged :5060 needs CAP_NET_BIND_SERVICE)
 
-next_hop: pbx.internal:5060   # downstream PBX (UDP by default; append ;transport=tcp to the URI to use TCP)
+next_hop:
+  uri: pbx.internal:5060       # downstream PBX URI
+  transport: udp               # udp | tcp | tls (tls requires tls_profile below)
 
 rtp:
   port_range: 10000-20000     # UDP port range the anchored RTP sessions allocate from

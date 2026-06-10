@@ -71,15 +71,17 @@ variables. The file is read once at startup; a config change means a restart.
 
 ## Configuration
 
-Complete instance configuration. Required keys: `sip.listen`, `next_hop`,
-`rtp.port_range`, `sequence`. Startup fails fast with a clear error if a required key
-is missing.
+Complete instance configuration. Required keys: `sip.listen`, `next_hop` (an object with
+`uri`), `rtp.port_range`, `sequence`. Startup fails fast with a clear error if a required
+key is missing or a reference is broken.
 
 ```yaml
 # config.yaml — complete instance configuration
 sip:
   listen: 0.0.0.0:5060          # SIP listen address/port
-next_hop: pbx.internal:5060     # terminating next-hop (PBX)
+next_hop:                       # terminating next-hop (PBX) — object form
+  uri: pbx.internal:5060
+  transport: udp                # udp | tcp | tls (default udp; tls needs tls_profile)
 rtp:
   port_range: 10000-20000       # anchored media port range
 observability:
@@ -90,6 +92,7 @@ sequence:                       # ordered application chain — list order IS ch
     uri: sip:transcriber.internal:5060
     on_failure: skip            # skip | abort
     media: tap                  # tap | none (default none)
+    transport: tcp              # udp | tcp | tls (default udp; tls needs tls_profile)
   - name: record
     uri: sip:recorder.internal:5060
     on_failure: skip
@@ -100,6 +103,10 @@ sequence:                       # ordered application chain — list order IS ch
     media: none
 ```
 
+> **Breaking change:** `next_hop` is now an **object** (`uri` + optional
+> `transport`/`tls_profile`). The previous scalar form (`next_hop: host:port`) is no
+> longer accepted; migrate to `next_hop:\n  uri: host:port`.
+
 ### Application fields
 
 | Field        | Meaning                                                                 |
@@ -108,10 +115,69 @@ sequence:                       # ordered application chain — list order IS ch
 | `uri`        | SIP URI / next-hop of the external application server.                   |
 | `on_failure` | `abort` — required app; failure fails the call. `skip` — best-effort; on failure log, emit metric, advance. **Default: `skip`.** |
 | `media`      | `tap` — app receives a fork of the call audio (stereo, recvonly). `none` *(default)* — no media (audio `inactive`). |
+| `transport`  | `udp` *(default)* \| `tcp` \| `tls`. `tls` requires a `tls_profile` naming an entry in `tls_profiles`. |
 
 **Signaling vs media are orthogonal.** Every app is inserted into the SIP signaling
 chain in order (so it can accept/reject) regardless of `media`; `media` only controls
 whether it also receives the call's audio.
+
+### Next-hop fields
+
+| Field                | Meaning                                                                 |
+|----------------------|-------------------------------------------------------------------------|
+| `next_hop.uri`       | Required. SIP URI / `host:port` of the terminating hop (PBX).            |
+| `next_hop.transport` | `udp` *(default)* \| `tcp` \| `tls`. `tls` requires a `tls_profile`.     |
+| `next_hop.tls_profile` | Name of a `tls_profiles` entry. Only valid when `transport: tls`.     |
+
+### TLS configuration
+
+> **Parse/validate only (US12).** TLS config is **parsed, resolved, and validated** at
+> startup, but TLS listeners and handshakes are **not yet wired** (US13–16). A `transport:
+> tls` endpoint or a `tls.listen` block is accepted and checked for correct wiring, but
+> does not yet establish TLS. Use plain `udp`/`tcp` until US13–16 land.
+
+Named, reusable `tls_profiles` (certificate material + crypto/verification/timeout
+policy) are referenced by name from TLS endpoints — the optional `tls.listen` listener,
+`sequence` items, and `next_hop`. Defaults are secure: TLS 1.2 floor, peer verification
+off, verify depth 2, dates checked.
+
+```yaml
+tls:                            # optional TLS listener (coexists with sip.listen)
+  listen: 0.0.0.0:5061
+  tls_profile: inbound
+tls_profiles:
+  inbound:
+    cert: /etc/certs/server.pem
+    key: /etc/certs/server.key
+  outbound:
+    cert: /etc/certs/client.pem
+    key: /etc/certs/client.key
+    ca: /etc/certs/ca.pem
+    min_version: tlsv1.3        # tlsv1.2 (default) | tlsv1.3
+    verify_peer: true           # default false
+    verify_depth: 3             # default 2
+    verify_dates: true          # default true
+    verify_subjects:            # optional allowed-subject list
+      - pbx.internal
+    connect_timeout: 5s         # Go duration; default 0 (unlimited)
+```
+
+| Field             | Meaning                                                            |
+|-------------------|--------------------------------------------------------------------|
+| `cert` / `key`    | Required. Certificate and private key paths.                       |
+| `passphrase`      | Optional private-key passphrase.                                   |
+| `ca`              | Optional CA bundle for peer verification.                          |
+| `min_version`     | `tlsv1.2` *(default)* \| `tlsv1.3`.                                 |
+| `ciphers`         | Optional cipher list (validated by the TLS provider, not here).    |
+| `verify_peer`     | Verify the peer certificate. **Default `false`.**                  |
+| `verify_depth`    | Max chain depth. **Default `2`.**                                  |
+| `verify_dates`    | Enforce cert validity dates. **Default `true`.**                   |
+| `verify_subjects` | Optional list of allowed certificate subjects.                     |
+| `connect_timeout` | Go duration (e.g. `5s`). **Default `0`** (unlimited).              |
+
+Profiles are validated for wiring (every referenced name must exist; a `tls_profile` on a
+non-TLS endpoint is rejected) but **no certificate files are opened at parse time** —
+loadability is checked downstream (US13).
 
 ### Observability fields
 
@@ -161,10 +227,12 @@ Tracked against the [user stories](requirements/).
 - Unmanaged-method pass-through — stateless forward to PBX (US11)
 - Observability — Prometheus `/metrics` + `/health` endpoint, opt-in via `observability.listen` (US8)
 - Deployment / release — single static binary, systemd unit, tagged release builds (US9)
+- TLS config model — parse/resolve/validate `tls_profiles` + `transport` + `tls.listen` wiring (US12)
 
 **Not yet implemented**
 
 - Mid-call signaling — re-INVITE / hold / REFER propagation (US7)
+- TLS runtime — certificate loading, TLS listeners, outbound TLS dialing/handshake (US13–16)
 
 ## Use Cases
 
@@ -230,7 +298,8 @@ Edit `/etc/voipstack-sip-sequencer/config.yaml`. Use the **same IP** as the Free
 sip:
   listen: 192.168.1.10:5080      # same interface as FreeSWITCH, different port
 
-next_hop: 192.168.1.10:5060     # FreeSWITCH's internal profile (UDP)
+next_hop:
+  uri: 192.168.1.10:5060         # FreeSWITCH's internal profile (UDP)
 
 rtp:
   port_range: 30000-30100        # must not overlap with FreeSWITCH's range
@@ -271,7 +340,7 @@ If you ever want to bypass the sequencer, point the UAC back to `:5060`. FreeSWI
 
 Current constraints and features not yet supported. See [PRD.md §8](PRD.md) for the full non-goals list.
 
-- **Transport:** Inbound listener is UDP. Application legs always use TCP (so large SDP offers are not capped by the UDP MTU guard); the next-hop leg is UDP by default and can opt into TCP via `;transport=tcp` on its URI. No TLS or WebSocket.
+- **Transport:** Inbound listener is UDP. Application legs always use TCP (so large SDP offers are not capped by the UDP MTU guard); the next-hop leg is UDP by default and can opt into TCP via `transport: tcp`. TLS is **config-only** so far — `transport: tls` and `tls.listen` parse and validate but do not yet establish TLS (runtime is US13–16). No WebSocket.
 - **Media security:** Plain RTP only. No SIPS, SIP over TLS, or SRTP.
 - **NAT traversal:** No STUN, TURN, ICE, or hole-punching for SIP or RTP.
 - **Sequencing:** Static linear sequence only. No branching, looping, or dynamic routing.

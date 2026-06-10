@@ -14,13 +14,30 @@ import (
 	"github.com/voipstack/voipstack-sip-sequencer/internal/config"
 )
 
-// withTCP returns u with its transport URI parameter forced to tcp, overriding any
-// existing value. It does not mutate u's params (the clone is fresh).
-func withTCP(u sip.Uri) sip.Uri {
+// withTransport returns u with its transport URI parameter forced to the given value,
+// overriding any existing one. It does not mutate u's params (the clone is fresh).
+func withTransport(u sip.Uri, transport string) sip.Uri {
 	params := u.UriParams.Clone()
-	params.Add("transport", "tcp")
+	params.Add("transport", transport)
 	u.UriParams = params
 	return u
+}
+
+// withTCP forces transport=tcp. Plain application legs always run over TCP because the
+// offer (grown in tap mode) can exceed sipgo's UDP MTU guard.
+func withTCP(u sip.Uri) sip.Uri {
+	return withTransport(u, "tcp")
+}
+
+// dialContext bounds the dial — where sipgo performs the TCP+TLS connect — by the
+// profile's connect_timeout when one is set, so a dead TLS peer fails fast instead of
+// hanging the call. A zero timeout (or nil profile) leaves the dial unbounded. The
+// caller always invokes the returned cancel once the dial returns, before answer wait.
+func dialContext(parent context.Context, rp *config.ResolvedTLSProfile) (context.Context, context.CancelFunc) {
+	if rp != nil && rp.ConnectTimeout > 0 {
+		return context.WithTimeout(parent, rp.ConnectTimeout)
+	}
+	return parent, func() {}
 }
 
 // handleInvite is the INVITE handler. It accepts the inbound dialog, creates a
@@ -186,10 +203,6 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 			e.fail(call, 500, "Server Error", "bad app URI")
 			return false
 		}
-		// Application legs always run over TCP: the offer carries the caller's SDP
-		// (grown further in tap mode), which can exceed sipgo's UDP MTU guard.
-		appURI = withTCP(appURI)
-
 		// Build the INVITE body for this app based on its media mode.
 		hasTap := app.Media == config.MediaTap
 		var inviteBody []byte
@@ -228,11 +241,25 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 			}
 		}
 
+		// Transport switch: a tls app dials over its profile's per-profile dialer with a
+		// connect-timeout-bounded context; any other transport keeps the forced-TCP plain
+		// dialer unchanged. The single transport value selects the path.
+		cache := e.dialogCliCache
+		dialCtx, dialCancel := ctx, context.CancelFunc(func() {})
+		if app.Transport == config.TransportTLS {
+			appURI = withTransport(appURI, "tls")
+			cache = e.tlsDialers[app.TLSProfile]
+			dialCtx, dialCancel = dialContext(ctx, app.Resolved)
+		} else {
+			appURI = withTCP(appURI)
+		}
+
 		appLegID := newLegID()
 		appHeaders := append(call.forwardHeaders(),
 			sip.NewHeader("X-Sequencer-Call-Id", call.id),
 			sip.NewHeader("X-Sequencer-Leg-Id", appLegID))
-		appSess, err := e.dialogCliCache.Invite(ctx, appURI, inviteBody, appHeaders...)
+		appSess, err := cache.Invite(dialCtx, appURI, inviteBody, appHeaders...)
+		dialCancel()
 		if err != nil {
 			if hasTap {
 				tap.release(e.ports)
@@ -429,27 +456,42 @@ func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, st
 	}
 
 	var pbxURI sip.Uri
-	if err := sip.ParseUri(e.cfg.NextHop, &pbxURI); err != nil {
-		slog.Error("parse pbx URI", "uri", e.cfg.NextHop, "err", err)
+	if err := sip.ParseUri(e.cfg.NextHop.URI, &pbxURI); err != nil {
+		slog.Error("parse pbx URI", "uri", e.cfg.NextHop.URI, "err", err)
 		e.fail(call, 500, "Server Error", "bad pbx URI")
 		return false
+	}
+
+	// Next-hop transport switch: tls dials over its profile's per-profile dialer with a
+	// connect-timeout-bounded context; tcp forces transport=tcp on the plain dialer;
+	// udp/unset keeps today's plain UDP path unchanged.
+	cache := e.dialogCliCache
+	dialCtx, dialCancel := ctx, context.CancelFunc(func() {})
+	switch e.cfg.NextHop.Transport {
+	case config.TransportTLS:
+		pbxURI = withTransport(pbxURI, "tls")
+		cache = e.tlsDialers[e.cfg.NextHop.TLSProfile]
+		dialCtx, dialCancel = dialContext(ctx, e.cfg.NextHop.Resolved)
+	case config.TransportTCP:
+		pbxURI = withTransport(pbxURI, "tcp")
 	}
 
 	pbxLegID := newLegID()
 	pbxHeaders := append(call.forwardHeaders(),
 		sip.NewHeader("X-Sequencer-Call-Id", call.id),
 		sip.NewHeader("X-Sequencer-Leg-Id", pbxLegID))
-	pbxSess, err := e.dialogCliCache.Invite(ctx, pbxURI, pbxOffer, pbxHeaders...)
+	pbxSess, err := cache.Invite(dialCtx, pbxURI, pbxOffer, pbxHeaders...)
+	dialCancel()
 	if err != nil {
 		e.metrics.TerminatingHopFailure()
-		slog.Error("originate pbx leg", "uri", e.cfg.NextHop, "err", err)
+		slog.Error("originate pbx leg", "uri", e.cfg.NextHop.URI, "err", err)
 		e.fail(call, 503, "Service Unavailable", "pbx leg originate failed")
 		return false
 	}
 	call.mu.Lock()
 	call.pbxLeg = &OutboundLeg{
 		role:      rolePBX,
-		targetURI: e.cfg.NextHop,
+		targetURI: e.cfg.NextHop.URI,
 		legID:     pbxLegID,
 		session:   pbxSess,
 	}

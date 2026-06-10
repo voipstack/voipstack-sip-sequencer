@@ -192,7 +192,7 @@ func TestHeadersOnEveryOutboundHopInclPBX(t *testing.T) {
 	listenAddr := freeAddr(t)
 	cfg := config.Config{
 		SIP:     config.SIP{Listen: listenAddr},
-		NextHop: pbx.sipURI(),
+		NextHop: config.NextHop{URI: pbx.sipURI()},
 		RTP:     config.RTP{PortRange: "20000-20100"},
 		Sequence: []config.Application{
 			{Name: "tapapp", URI: tapApp.sipURI(), OnFailure: config.FailureSkip, Media: config.MediaTap},

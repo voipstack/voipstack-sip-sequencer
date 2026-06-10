@@ -60,7 +60,7 @@ func TestBadPortRangeFailsAtNew(t *testing.T) {
 	for _, pr := range badCfgs {
 		cfg := config.Config{
 			SIP:     config.SIP{Listen: "127.0.0.1:0"},
-			NextHop: "sip:127.0.0.1:5060",
+			NextHop: config.NextHop{URI: "sip:127.0.0.1:5060"},
 			RTP:     config.RTP{PortRange: pr},
 		}
 		_, err := New(cfg)
@@ -290,7 +290,7 @@ func TestMediaPortsReleasedOnTeardown(t *testing.T) {
 	// Range of exactly 2 pairs (4 ports) so that if ports are not released the second call fails.
 	cfg := config.Config{
 		SIP:      config.SIP{Listen: listenAddr},
-		NextHop:  pbx.sipURI(),
+		NextHop:  config.NextHop{URI: pbx.sipURI()},
 		RTP:      config.RTP{PortRange: "12000-12006"}, // 3 pairs: 12000,12002,12004
 		Sequence: []config.Application{{Name: "app", URI: app.sipURI(), OnFailure: config.FailureSkip}},
 	}
@@ -352,7 +352,7 @@ func TestPortExhaustionFailsCleanly(t *testing.T) {
 	// Range: exactly 1 pair per side × 2 sides = need 2 pairs = 4 ports: 12100-12104 gives 2 pairs (12100,12102)
 	cfg := config.Config{
 		SIP:      config.SIP{Listen: listenAddr},
-		NextHop:  pbx.sipURI(),
+		NextHop:  config.NextHop{URI: pbx.sipURI()},
 		RTP:      config.RTP{PortRange: "12100-12104"},
 		Sequence: []config.Application{{Name: "app", URI: app.sipURI(), OnFailure: config.FailureSkip}},
 	}
@@ -557,7 +557,7 @@ func TestMediaPortsWithinConfiguredRange(t *testing.T) {
 	listenAddr := freeAddr(t)
 	cfg := config.Config{
 		SIP:      config.SIP{Listen: listenAddr},
-		NextHop:  pbx.sipURI(),
+		NextHop:  config.NextHop{URI: pbx.sipURI()},
 		RTP:      config.RTP{PortRange: "13000-14000"},
 		Sequence: []config.Application{{Name: "app", URI: app.sipURI(), OnFailure: config.FailureSkip}},
 	}

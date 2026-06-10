@@ -61,7 +61,7 @@ func autoAnswerTapWith(t *testing.T, uas *fakeUAS, sdpFn func() []byte) {
 func tapConfig(listenAddr, tapURI, pbxURI string) config.Config {
 	return config.Config{
 		SIP:     config.SIP{Listen: listenAddr},
-		NextHop: pbxURI,
+		NextHop: config.NextHop{URI: pbxURI},
 		RTP:     config.RTP{PortRange: "16000-18000"},
 		Sequence: []config.Application{
 			{Name: "tapapp", URI: tapURI, OnFailure: config.FailureSkip, Media: config.MediaTap},
@@ -326,7 +326,7 @@ func TestMediaNoneAppGetsNoMedia(t *testing.T) {
 	listenAddr := freeAddr(t)
 	cfg := config.Config{
 		SIP:     config.SIP{Listen: listenAddr},
-		NextHop: pbxUAS.sipURI(),
+		NextHop: config.NextHop{URI: pbxUAS.sipURI()},
 		RTP:     config.RTP{PortRange: "16100-17000"},
 		Sequence: []config.Application{
 			{Name: "noneapp", URI: noneApp.sipURI(), OnFailure: config.FailureSkip, Media: config.MediaNone},
@@ -447,7 +447,7 @@ func TestPortExhaustionDuringTapAborts(t *testing.T) {
 	// Range = 1 pair only: tap-caller gets it; tap-callee acquisition exhausts the range.
 	cfg := config.Config{
 		SIP:     config.SIP{Listen: listenAddr},
-		NextHop: pbxUAS.sipURI(),
+		NextHop: config.NextHop{URI: pbxUAS.sipURI()},
 		RTP:     config.RTP{PortRange: "17000-17001"},
 		Sequence: []config.Application{
 			{Name: "tapapp", URI: tapUAS.sipURI(), OnFailure: config.FailureAbort, Media: config.MediaTap},
@@ -486,7 +486,7 @@ func TestPortExhaustionDuringTapSkips(t *testing.T) {
 	// ep then acquires the released pair; pbx exhausts → 503 from media section (not tap section).
 	cfg := config.Config{
 		SIP:     config.SIP{Listen: listenAddr},
-		NextHop: pbxUAS.sipURI(),
+		NextHop: config.NextHop{URI: pbxUAS.sipURI()},
 		RTP:     config.RTP{PortRange: "17100-17101"},
 		Sequence: []config.Application{
 			{Name: "tapapp", URI: tapUAS.sipURI(), OnFailure: config.FailureSkip, Media: config.MediaTap},
@@ -532,7 +532,7 @@ func TestForkPortsReleasedOnTeardown(t *testing.T) {
 	// 4 pairs: exactly enough for one tap call (tap-caller, tap-callee, ep, pbx).
 	cfg := config.Config{
 		SIP:     config.SIP{Listen: listenAddr},
-		NextHop: pbxUAS.sipURI(),
+		NextHop: config.NextHop{URI: pbxUAS.sipURI()},
 		RTP:     config.RTP{PortRange: "17200-17208"},
 		Sequence: []config.Application{
 			{Name: "tapapp", URI: tapUAS.sipURI(), OnFailure: config.FailureSkip, Media: config.MediaTap},
@@ -593,7 +593,7 @@ func TestForkPortsReleasedWhenPBXFails(t *testing.T) {
 	// 4 pairs: tap-caller, tap-callee, ep, pbx — exactly one tap call's worth.
 	cfg := config.Config{
 		SIP:     config.SIP{Listen: listenAddr},
-		NextHop: pbxUAS.sipURI(),
+		NextHop: config.NextHop{URI: pbxUAS.sipURI()},
 		RTP:     config.RTP{PortRange: "17400-17408"},
 		Sequence: []config.Application{
 			{Name: "tapapp", URI: tapUAS.sipURI(), OnFailure: config.FailureSkip, Media: config.MediaTap},
@@ -660,7 +660,7 @@ func TestMultipleTapAppsEachReceiveBothDirections(t *testing.T) {
 	listenAddr := freeAddr(t)
 	cfg := config.Config{
 		SIP:     config.SIP{Listen: listenAddr},
-		NextHop: pbxUAS.sipURI(),
+		NextHop: config.NextHop{URI: pbxUAS.sipURI()},
 		RTP:     config.RTP{PortRange: "17300-18000"},
 		Sequence: []config.Application{
 			{Name: "tapA", URI: tapA.sipURI(), OnFailure: config.FailureSkip, Media: config.MediaTap},

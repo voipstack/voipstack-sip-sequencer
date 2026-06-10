@@ -43,17 +43,20 @@ func startObsEngine(t *testing.T, cfg config.Config) *Engine {
 	return startEngine(t, cfg, 0, NewPromMetrics())
 }
 
-// scrape issues a real HTTP GET against the in-process server and returns the body.
+// scrape issues a real HTTP GET against the in-process server and returns the status
+// and body. A transient request error (the obs HTTP server binds on its own goroutine,
+// so an early scrape can race the bind) returns 0,"" so the caller's retry loop can
+// poll until the server is up rather than failing the test on the first refusal.
 func scrape(t *testing.T, obsAddr, path string) (int, string) {
 	t.Helper()
 	resp, err := http.Get("http://" + obsAddr + path)
 	if err != nil {
-		t.Fatalf("scrape %s: %v", path, err)
+		return 0, ""
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
+		return 0, ""
 	}
 	return resp.StatusCode, string(body)
 }
