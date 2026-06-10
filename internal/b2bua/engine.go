@@ -2,7 +2,10 @@ package b2bua
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -12,6 +15,7 @@ import (
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/voipstack/voipstack-sip-sequencer/internal/config"
 	"github.com/voipstack/voipstack-sip-sequencer/internal/tlsprov"
@@ -28,6 +32,7 @@ type Engine struct {
 	calls          *Registry
 	metrics        MetricsSink
 	tlsProvider    tlsprov.Provider
+	tlsServerConf  *tls.Config
 	runCtx         context.Context
 	runCancel      context.CancelFunc
 	legTimeout     time.Duration
@@ -105,11 +110,29 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 	for _, opt := range opts {
 		opt(e)
 	}
+
+	// Build the inbound TLS server context once, before any socket binds, so a bad
+	// certificate or policy aborts startup (fail-fast) rather than running degraded.
+	if cfg.TLS.Listen != "" {
+		if e.tlsProvider == nil {
+			return nil, fmt.Errorf("tls.listen %q configured but no TLS provider", cfg.TLS.Listen)
+		}
+		if cfg.TLS.Resolved == nil {
+			return nil, fmt.Errorf("tls.listen %q has no resolved profile", cfg.TLS.Listen)
+		}
+		conf, err := e.tlsProvider.ServerConfig(*cfg.TLS.Resolved)
+		if err != nil {
+			return nil, fmt.Errorf("build tls server context: %w", err)
+		}
+		e.tlsServerConf = conf
+	}
+
 	return e, nil
 }
 
-// Run registers SIP handlers, starts the UDP listener on cfg.SIP.Listen, and
-// blocks until ctx is cancelled.
+// Run registers SIP handlers and starts the plain UDP listener on cfg.SIP.Listen,
+// plus — when a tls.listen is configured — the inbound TLS listener in parallel on
+// the same server. It blocks until ctx is cancelled or a listener fails.
 func (e *Engine) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	e.runCtx = ctx
@@ -138,7 +161,79 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.startObservability(ctx)
 	}
 
-	return e.srv.ListenAndServe(ctx, "udp", e.cfg.SIP.Listen)
+	// Plain UDP and TLS run as independent sockets on the shared server. errgroup
+	// ties them to one context: if either fails (e.g. a TLS bind error at startup),
+	// the sibling is cancelled and Run returns that error (fail-fast).
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return e.srv.ListenAndServe(gctx, "udp", e.cfg.SIP.Listen)
+	})
+	if e.tlsServerConf != nil {
+		g.Go(func() error {
+			return e.serveTLS(gctx, e.cfg.TLS.Listen, e.tlsServerConf)
+		})
+	}
+	return g.Wait()
+}
+
+// serveTLS binds the inbound TLS listener on addr and serves SIP over it on the
+// shared server. Binding is synchronous so a bad bind fails Run fast; each
+// connection's handshake runs on the server's own per-connection goroutine, so a
+// slow or failed handshake never blocks other accepts or the plain listener. A
+// rejected handshake is logged with the peer address and a sanitized reason — never
+// certificate or key bytes. A clean ctx cancellation returns nil, matching the
+// plain listener's shutdown semantics.
+func (e *Engine) serveTLS(ctx context.Context, addr string, conf *tls.Config) error {
+	ln, err := tls.Listen("tcp", addr, conf)
+	if err != nil {
+		return fmt.Errorf("listen tls %q: %w", addr, err)
+	}
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+	}()
+
+	err = e.srv.ServeTLS(&auditListener{Listener: ln, log: slog.Default()})
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
+}
+
+// auditListener wraps a TLS listener so each accepted connection carries the audit
+// hook that logs its own handshake failure when the SIP server first reads from it.
+type auditListener struct {
+	net.Listener
+	log *slog.Logger
+}
+
+func (l *auditListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &auditConn{Conn: c, log: l.log}, nil
+}
+
+// auditConn logs a rejected TLS handshake once, with the peer address and a
+// sanitized reason. crypto/tls performs the server handshake lazily on the first
+// Read; when it fails the connection's handshake is still incomplete and Read
+// returns the handshake error, whose text carries no certificate or key bytes.
+type auditConn struct {
+	net.Conn
+	log    *slog.Logger
+	logged bool
+}
+
+func (c *auditConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if err != nil && err != io.EOF && !errors.Is(err, io.EOF) && !c.logged {
+		if tc, ok := c.Conn.(*tls.Conn); ok && !tc.ConnectionState().HandshakeComplete {
+			c.logged = true
+			c.log.Warn("tls handshake rejected", "peer", c.Conn.RemoteAddr().String(), "reason", err.Error())
+		}
+	}
+	return n, err
 }
 
 // obsExposer is the metrics-backend surface the observability server needs: a
