@@ -26,18 +26,24 @@ type Material struct {
 }
 
 // Provider is the consumer-facing TLS boundary. An alternate implementation
-// (OpenSSL/HSM) satisfies the same interface without changing callers.
+// (OpenSSL/HSM) satisfies the same interface without changing callers. ServerConfig
+// and ClientConfig turn a resolved profile into a ready-to-use *tls.Config for
+// inbound listeners and outbound dialers respectively.
 type Provider interface {
 	Load(rp config.ResolvedTLSProfile) (*Material, error)
+	ServerConfig(rp config.ResolvedTLSProfile) (*tls.Config, error)
+	ClientConfig(rp config.ResolvedTLSProfile) (*tls.Config, error)
 }
 
 // StdProvider is the default Provider over the Go standard library. It caches
 // loaded Material keyed by the cert+key path pair so a certificate referenced by
-// several endpoints is read from disk exactly once.
+// several endpoints is read from disk exactly once, and built *tls.Config values
+// keyed by role+profile so a profile's context is assembled exactly once.
 type StdProvider struct {
-	mu    sync.Mutex
-	cache map[string]*Material
-	log   *slog.Logger
+	mu       sync.Mutex
+	cache    map[string]*Material
+	cfgCache map[string]*tls.Config
+	log      *slog.Logger
 }
 
 // NewStdProvider constructs a StdProvider. A nil log defaults to slog.Default().
@@ -46,8 +52,9 @@ func NewStdProvider(log *slog.Logger) *StdProvider {
 		log = slog.Default()
 	}
 	return &StdProvider{
-		cache: map[string]*Material{},
-		log:   log,
+		cache:    map[string]*Material{},
+		cfgCache: map[string]*tls.Config{},
+		log:      log,
 	}
 }
 
