@@ -429,8 +429,8 @@ func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, st
 	}
 
 	var pbxURI sip.Uri
-	if err := sip.ParseUri(e.cfg.NextHop, &pbxURI); err != nil {
-		slog.Error("parse pbx URI", "uri", e.cfg.NextHop, "err", err)
+	if err := sip.ParseUri(e.cfg.NextHop.URI, &pbxURI); err != nil {
+		slog.Error("parse pbx URI", "uri", e.cfg.NextHop.URI, "err", err)
 		e.fail(call, 500, "Server Error", "bad pbx URI")
 		return false
 	}
@@ -442,14 +442,14 @@ func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, st
 	pbxSess, err := e.dialogCliCache.Invite(ctx, pbxURI, pbxOffer, pbxHeaders...)
 	if err != nil {
 		e.metrics.TerminatingHopFailure()
-		slog.Error("originate pbx leg", "uri", e.cfg.NextHop, "err", err)
+		slog.Error("originate pbx leg", "uri", e.cfg.NextHop.URI, "err", err)
 		e.fail(call, 503, "Service Unavailable", "pbx leg originate failed")
 		return false
 	}
 	call.mu.Lock()
 	call.pbxLeg = &OutboundLeg{
 		role:      rolePBX,
-		targetURI: e.cfg.NextHop,
+		targetURI: e.cfg.NextHop.URI,
 		legID:     pbxLegID,
 		session:   pbxSess,
 	}

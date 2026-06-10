@@ -199,7 +199,7 @@ func freeAddr(t *testing.T) string {
 func testConfig(listenAddr, appURI, pbxURI string) config.Config {
 	return config.Config{
 		SIP:     config.SIP{Listen: listenAddr},
-		NextHop: pbxURI,
+		NextHop: config.NextHop{URI: pbxURI},
 		RTP:     config.RTP{PortRange: "10000-20000"},
 		Sequence: []config.Application{
 			{Name: "testapp", URI: appURI, OnFailure: config.FailureSkip},
@@ -695,7 +695,7 @@ func autoAnswer(t *testing.T, f *fakeUAS, name string, rec *orderRecorder) {
 func multiAppConfig(listenAddr, pbxURI string, apps []config.Application) config.Config {
 	return config.Config{
 		SIP:      config.SIP{Listen: listenAddr},
-		NextHop:  pbxURI,
+		NextHop:  config.NextHop{URI: pbxURI},
 		RTP:      config.RTP{PortRange: "10000-20000"},
 		Sequence: apps,
 	}

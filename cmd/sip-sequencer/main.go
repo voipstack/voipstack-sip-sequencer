@@ -11,6 +11,7 @@ import (
 
 	"github.com/voipstack/voipstack-sip-sequencer/internal/b2bua"
 	"github.com/voipstack/voipstack-sip-sequencer/internal/config"
+	"github.com/voipstack/voipstack-sip-sequencer/internal/tlsprov"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=...".
@@ -40,7 +41,16 @@ func main() {
 
 	slog.Info("starting voipstack-sip-sequencer", "version", version)
 
+	// Eagerly load every referenced TLS certificate so an unloadable cert aborts
+	// before any listener binds.
+	provider := tlsprov.NewStdProvider(slog.Default())
+	if err := tlsprov.LoadAll(cfg, provider); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
 	var opts []b2bua.Option
+	opts = append(opts, b2bua.WithTLSProvider(provider))
 	if cfg.Observability.Listen != "" {
 		opts = append(opts, b2bua.WithMetrics(b2bua.NewPromMetrics()))
 	}

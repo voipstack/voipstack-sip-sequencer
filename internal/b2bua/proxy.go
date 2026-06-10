@@ -38,8 +38,8 @@ func (e *Engine) proxyUnmanaged(req *sip.Request, tx sip.ServerTransaction) {
 
 	// Determine next-hop address.
 	var nextHop sip.Uri
-	if err := sip.ParseUri(e.cfg.NextHop, &nextHop); err != nil {
-		slog.Error("proxy: parse next-hop URI", "nextHop", e.cfg.NextHop, "err", err)
+	if err := sip.ParseUri(e.cfg.NextHop.URI, &nextHop); err != nil {
+		slog.Error("proxy: parse next-hop URI", "nextHop", e.cfg.NextHop.URI, "err", err)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 500, "Internal Server Error", nil))
 		return
 	}
@@ -49,7 +49,7 @@ func (e *Engine) proxyUnmanaged(req *sip.Request, tx sip.ServerTransaction) {
 	ctx := e.runCtx
 	clientTx, err := e.cli.TransactionRequest(ctx, fwd, sipgo.ClientRequestAddVia)
 	if err != nil {
-		slog.Error(fmt.Sprintf("proxy %s to %q: %v", req.Method, e.cfg.NextHop, err))
+		slog.Error(fmt.Sprintf("proxy %s to %q: %v", req.Method, e.cfg.NextHop.URI, err))
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 502, "Bad Gateway", nil))
 		return
 	}

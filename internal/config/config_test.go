@@ -11,7 +11,8 @@ import (
 const completeYAML = `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence:
@@ -35,8 +36,8 @@ func TestParseLoadsCompleteConfigPreservingOrder(t *testing.T) {
 	if cfg.SIP.Listen != "0.0.0.0:5060" {
 		t.Errorf("sip.listen = %q, want %q", cfg.SIP.Listen, "0.0.0.0:5060")
 	}
-	if cfg.NextHop != "sip:proxy.example.com" {
-		t.Errorf("next_hop = %q, want %q", cfg.NextHop, "sip:proxy.example.com")
+	if cfg.NextHop.URI != "sip:proxy.example.com" {
+		t.Errorf("next_hop = %q, want %q", cfg.NextHop.URI, "sip:proxy.example.com")
 	}
 	if cfg.RTP.PortRange != "10000-20000" {
 		t.Errorf("rtp.port_range = %q, want %q", cfg.RTP.PortRange, "10000-20000")
@@ -60,7 +61,8 @@ func TestParseDefaultsOmittedOnFailureToSkip(t *testing.T) {
 	yaml := `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence:
@@ -87,7 +89,8 @@ func TestParseFailsWhenRequiredKeyMissing(t *testing.T) {
 	baseYAML := `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence: []
@@ -100,7 +103,8 @@ sequence: []
 		{
 			name: "missing sip.listen",
 			yaml: `
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence: []
@@ -112,7 +116,8 @@ sequence: []
 			yaml: `
 sip:
   listen: ""
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence: []
@@ -135,7 +140,8 @@ sequence: []
 			yaml: `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp: {}
 sequence: []
 `,
@@ -146,7 +152,8 @@ sequence: []
 			yaml: `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 `,
@@ -211,11 +218,11 @@ func TestParseIgnoresEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.NextHop == "sip:env-injected.example.com" {
+	if cfg.NextHop.URI == "sip:env-injected.example.com" {
 		t.Error("next_hop was read from environment variable — must come only from YAML")
 	}
-	if cfg.NextHop != "sip:proxy.example.com" {
-		t.Errorf("next_hop = %q, want %q", cfg.NextHop, "sip:proxy.example.com")
+	if cfg.NextHop.URI != "sip:proxy.example.com" {
+		t.Errorf("next_hop = %q, want %q", cfg.NextHop.URI, "sip:proxy.example.com")
 	}
 }
 
@@ -243,7 +250,8 @@ func TestParseFailsOnInvalidOnFailure(t *testing.T) {
 	yaml := `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence:
@@ -268,7 +276,8 @@ func TestParseAllowsEmptySequence(t *testing.T) {
 	yaml := `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence: []
@@ -297,7 +306,8 @@ func TestParseFailsOnEntryMissingNameOrURI(t *testing.T) {
 			yaml: `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence:
@@ -310,7 +320,8 @@ sequence:
 			yaml: `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence:
@@ -340,7 +351,8 @@ func TestParseDefaultsOmittedMediaToNone(t *testing.T) {
 	yaml := `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence:
@@ -361,7 +373,8 @@ func TestParseAcceptsMediaTap(t *testing.T) {
 	yaml := `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence:
@@ -383,7 +396,8 @@ func TestParseFailsOnInvalidMedia(t *testing.T) {
 	yaml := `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence:
@@ -420,7 +434,8 @@ func TestParseAcceptsExplicitLogLevel(t *testing.T) {
 	yaml := `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence: []
@@ -451,7 +466,8 @@ func TestParseFailsOnInvalidLogLevel(t *testing.T) {
 	yaml := `
 sip:
   listen: "0.0.0.0:5060"
-next_hop: "sip:proxy.example.com"
+next_hop:
+  uri: "sip:proxy.example.com"
 rtp:
   port_range: "10000-20000"
 sequence: []
@@ -463,6 +479,441 @@ log_level: verbose
 	}
 	if !strings.Contains(err.Error(), "verbose") {
 		t.Errorf("error %q does not mention bad value %q", err.Error(), "verbose")
+	}
+}
+
+func TestNoTLSKeysParsesPlain(t *testing.T) {
+	// Given: a complete config with an object next_hop and no TLS keys at all
+	// When: Parse is called
+	cfg, err := config.Parse([]byte(completeYAML), "test.yaml")
+
+	// Then: it succeeds, no resolved profiles, transports default to udp
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.TLS.Resolved != nil {
+		t.Error("tls.Resolved should be nil when no TLS configured")
+	}
+	if cfg.NextHop.Resolved != nil {
+		t.Error("next_hop.Resolved should be nil when no TLS configured")
+	}
+	if cfg.NextHop.Transport != config.TransportUDP {
+		t.Errorf("next_hop.transport = %q, want %q", cfg.NextHop.Transport, config.TransportUDP)
+	}
+	for i, app := range cfg.Sequence {
+		if app.Transport != config.TransportUDP {
+			t.Errorf("sequence[%d].transport = %q, want %q", i, app.Transport, config.TransportUDP)
+		}
+		if app.Resolved != nil {
+			t.Errorf("sequence[%d].Resolved should be nil when no TLS configured", i)
+		}
+	}
+}
+
+func TestProfileReusedSharesResolvedPointer(t *testing.T) {
+	// Given: an app and the next_hop both referencing the same tls_profile
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+  transport: tls
+  tls_profile: outbound
+rtp:
+  port_range: "10000-20000"
+tls_profiles:
+  outbound:
+    cert: /etc/certs/out.pem
+    key: /etc/certs/out.key
+sequence:
+  - name: app
+    uri: "sip:app.example.com"
+    transport: tls
+    tls_profile: outbound
+`
+	// When: Parse is called
+	cfg, err := config.Parse([]byte(yaml), "test.yaml")
+
+	// Then: both endpoints share the exact same *ResolvedTLSProfile pointer
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Sequence[0].Resolved == nil || cfg.NextHop.Resolved == nil {
+		t.Fatal("expected both endpoints resolved")
+	}
+	if cfg.Sequence[0].Resolved != cfg.NextHop.Resolved {
+		t.Error("endpoints naming the same profile must share one *ResolvedTLSProfile")
+	}
+	if cfg.NextHop.Resolved.Cert != "/etc/certs/out.pem" {
+		t.Errorf("resolved cert = %q, want %q", cfg.NextHop.Resolved.Cert, "/etc/certs/out.pem")
+	}
+}
+
+func TestTransportTLSWithoutProfileFails(t *testing.T) {
+	// Given: a sequence app with transport tls but no tls_profile
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+sequence:
+  - name: app
+    uri: "sip:app.example.com"
+    transport: tls
+`
+	// When/Then: parse fails naming the endpoint
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for tls transport without profile")
+	}
+	if !strings.Contains(err.Error(), "transport tls requires a tls_profile") {
+		t.Errorf("error %q missing expected reason", err.Error())
+	}
+}
+
+func TestTLSListenWithoutProfileFails(t *testing.T) {
+	// Given: a tls.listen block with no tls_profile
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+tls:
+  listen: "0.0.0.0:5061"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+sequence: []
+`
+	// When/Then: parse fails
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for tls.listen without profile")
+	}
+	if !strings.Contains(err.Error(), "tls.listen requires a tls_profile") {
+		t.Errorf("error %q missing expected reason", err.Error())
+	}
+}
+
+func TestUnknownProfileFails(t *testing.T) {
+	// Given: a tls.listen referencing a profile that does not exist
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+tls:
+  listen: "0.0.0.0:5061"
+  tls_profile: missing
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+sequence: []
+`
+	// When/Then: parse fails naming the unknown profile
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for unknown profile")
+	}
+	if !strings.Contains(err.Error(), "unknown tls_profile") || !strings.Contains(err.Error(), "missing") {
+		t.Errorf("error %q missing endpoint/profile name", err.Error())
+	}
+}
+
+func TestTLSAndPlainListenersCoexist(t *testing.T) {
+	// Given: both sip.listen and tls.listen set
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+tls:
+  listen: "0.0.0.0:5061"
+  tls_profile: inbound
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+tls_profiles:
+  inbound:
+    cert: /etc/certs/in.pem
+    key: /etc/certs/in.key
+sequence: []
+`
+	// When: Parse is called
+	cfg, err := config.Parse([]byte(yaml), "test.yaml")
+
+	// Then: both listeners present and tls resolved
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.SIP.Listen != "0.0.0.0:5060" {
+		t.Errorf("sip.listen = %q", cfg.SIP.Listen)
+	}
+	if cfg.TLS.Listen != "0.0.0.0:5061" {
+		t.Errorf("tls.listen = %q", cfg.TLS.Listen)
+	}
+	if cfg.TLS.Resolved == nil {
+		t.Error("tls listener should resolve a profile")
+	}
+}
+
+func TestOmittedPolicyDefaults(t *testing.T) {
+	// Given: a profile with only cert/key, all policy omitted
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+  transport: tls
+  tls_profile: outbound
+rtp:
+  port_range: "10000-20000"
+tls_profiles:
+  outbound:
+    cert: /etc/certs/out.pem
+    key: /etc/certs/out.key
+sequence: []
+`
+	// When: Parse is called
+	cfg, err := config.Parse([]byte(yaml), "test.yaml")
+
+	// Then: secure defaults applied to the resolved profile
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	r := cfg.NextHop.Resolved
+	if r == nil {
+		t.Fatal("expected resolved profile")
+	}
+	if r.MinVersion != config.TLSv12 {
+		t.Errorf("min_version = %q, want %q", r.MinVersion, config.TLSv12)
+	}
+	if r.VerifyPeer {
+		t.Error("verify_peer default should be false")
+	}
+	if r.VerifyDepth != 2 {
+		t.Errorf("verify_depth = %d, want 2", r.VerifyDepth)
+	}
+	if !r.VerifyDates {
+		t.Error("verify_dates default should be true")
+	}
+	if r.VerifySubjects != nil {
+		t.Errorf("verify_subjects default should be nil, got %v", r.VerifySubjects)
+	}
+	if r.ConnectTimeout != 0 {
+		t.Errorf("connect_timeout default should be 0, got %v", r.ConnectTimeout)
+	}
+}
+
+func TestNextHopObjectFormResolvesTLS(t *testing.T) {
+	// Given: the plain object form (uri only)
+	plainForm := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+sequence: []
+`
+	// When: parsed
+	cfg, err := config.Parse([]byte(plainForm), "test.yaml")
+	// Then: plain URI, udp default, no TLS
+	if err != nil {
+		t.Fatalf("plain form: unexpected error: %v", err)
+	}
+	if cfg.NextHop.URI != "sip:proxy.example.com" {
+		t.Errorf("plain form uri = %q", cfg.NextHop.URI)
+	}
+	if cfg.NextHop.Transport != config.TransportUDP {
+		t.Errorf("plain form transport = %q, want udp", cfg.NextHop.Transport)
+	}
+	if cfg.NextHop.Resolved != nil {
+		t.Error("plain form should not resolve a TLS profile")
+	}
+
+	// Given: the object form with TLS
+	objectForm := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+  transport: tls
+  tls_profile: outbound
+rtp:
+  port_range: "10000-20000"
+tls_profiles:
+  outbound:
+    cert: /etc/certs/out.pem
+    key: /etc/certs/out.key
+sequence: []
+`
+	// When: parsed
+	cfg, err = config.Parse([]byte(objectForm), "test.yaml")
+	// Then: TLS next hop resolved
+	if err != nil {
+		t.Fatalf("object form: unexpected error: %v", err)
+	}
+	if cfg.NextHop.Transport != config.TransportTLS {
+		t.Errorf("object form transport = %q, want tls", cfg.NextHop.Transport)
+	}
+	if cfg.NextHop.Resolved == nil {
+		t.Error("object form should resolve a TLS profile")
+	}
+}
+
+func TestNonTLSEndpointNeedsNoProfile(t *testing.T) {
+	// Given: a plain tcp app with no tls_profile
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+sequence:
+  - name: app
+    uri: "sip:app.example.com"
+    transport: tcp
+`
+	// When/Then: parse succeeds, no profile required
+	cfg, err := config.Parse([]byte(yaml), "test.yaml")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Sequence[0].Transport != config.TransportTCP {
+		t.Errorf("transport = %q, want tcp", cfg.Sequence[0].Transport)
+	}
+	if cfg.Sequence[0].Resolved != nil {
+		t.Error("non-TLS endpoint should have no resolved profile")
+	}
+}
+
+func TestTLSProfileOnPlainEndpointRejected(t *testing.T) {
+	// Given: a plain (udp) app carrying a tls_profile (R4 violation)
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+tls_profiles:
+  outbound:
+    cert: /etc/certs/out.pem
+    key: /etc/certs/out.key
+sequence:
+  - name: app
+    uri: "sip:app.example.com"
+    tls_profile: outbound
+`
+	// When/Then: parse fails naming the endpoint
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for tls_profile on plain endpoint")
+	}
+	if !strings.Contains(err.Error(), "tls_profile set but transport is") {
+		t.Errorf("error %q missing R4 reason", err.Error())
+	}
+}
+
+func TestInvalidMinVersionFails(t *testing.T) {
+	// Given: a profile with an unsupported min_version
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+tls_profiles:
+  outbound:
+    cert: /etc/certs/out.pem
+    key: /etc/certs/out.key
+    min_version: tlsv1.1
+sequence: []
+`
+	// When/Then: parse fails naming the profile and bad value
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for invalid min_version")
+	}
+	if !strings.Contains(err.Error(), "unsupported min_version") || !strings.Contains(err.Error(), "tlsv1.1") {
+		t.Errorf("error %q missing profile/value", err.Error())
+	}
+}
+
+func TestInvalidConnectTimeoutFails(t *testing.T) {
+	// Given: a profile with an unparseable connect_timeout
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+tls_profiles:
+  outbound:
+    cert: /etc/certs/out.pem
+    key: /etc/certs/out.key
+    connect_timeout: "soon"
+sequence: []
+`
+	// When/Then: parse fails
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for invalid connect_timeout")
+	}
+	if !strings.Contains(err.Error(), "invalid connect_timeout") {
+		t.Errorf("error %q missing expected reason", err.Error())
+	}
+}
+
+func TestEmptyVerifySubjectEntryFails(t *testing.T) {
+	// Given: a profile with an empty verify_subjects entry
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+tls_profiles:
+  outbound:
+    cert: /etc/certs/out.pem
+    key: /etc/certs/out.key
+    verify_subjects:
+      - "sip.example.com"
+      - ""
+sequence: []
+`
+	// When/Then: parse fails
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for empty verify_subjects entry")
+	}
+	if !strings.Contains(err.Error(), "verify_subjects") {
+		t.Errorf("error %q missing expected reason", err.Error())
+	}
+}
+
+func TestNextHopMissingURIFails(t *testing.T) {
+	// Given: an object next_hop present but with an empty uri
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  transport: udp
+rtp:
+  port_range: "10000-20000"
+sequence: []
+`
+	// When/Then: parse fails naming the missing uri key
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for next_hop with empty uri")
+	}
+	if !strings.Contains(err.Error(), "next_hop") || !strings.Contains(err.Error(), "uri") {
+		t.Errorf("error %q should name next_hop and uri", err.Error())
 	}
 }
 

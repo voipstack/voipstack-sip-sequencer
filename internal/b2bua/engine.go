@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/voipstack/voipstack-sip-sequencer/internal/config"
+	"github.com/voipstack/voipstack-sip-sequencer/internal/tlsprov"
 )
 
 // Engine owns the SIP UA, UDP listener, dialog caches, and active-call registry.
@@ -26,6 +27,7 @@ type Engine struct {
 	dialogCliCache *sipgo.DialogClientCache
 	calls          *Registry
 	metrics        MetricsSink
+	tlsProvider    tlsprov.Provider
 	runCtx         context.Context
 	runCancel      context.CancelFunc
 	legTimeout     time.Duration
@@ -42,6 +44,13 @@ type Option func(*Engine)
 // WithMetrics installs a MetricsSink, replacing the default noopMetrics.
 func WithMetrics(s MetricsSink) Option {
 	return func(e *Engine) { e.metrics = s }
+}
+
+// WithTLSProvider installs the TLS Provider so TLS listeners and dialers
+// (STORY-001-014/015/016) can reach loaded certificate material. This story
+// stores it only; the engine does not yet use it.
+func WithTLSProvider(p tlsprov.Provider) Option {
+	return func(e *Engine) { e.tlsProvider = p }
 }
 
 // New builds an Engine from cfg. The UDP listener is not opened until Run is called.
