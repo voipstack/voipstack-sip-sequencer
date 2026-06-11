@@ -33,6 +33,7 @@ type Engine struct {
 	metrics        MetricsSink
 	tlsProvider    tlsprov.Provider
 	tlsServerConf  *tls.Config
+	wssServerConf  *tls.Config
 	tlsDialers     map[string]*sipgo.DialogClientCache
 	tlsUAs         []*sipgo.UserAgent
 	runCtx         context.Context
@@ -130,6 +131,22 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 		e.tlsServerConf = conf
 	}
 
+	// Build the inbound WSS server context the same way (fail-fast), mirroring the
+	// tls.listen block. WSS reuses the audited TLS profile model verbatim.
+	if cfg.WSS.Listen != "" {
+		if e.tlsProvider == nil {
+			return nil, fmt.Errorf("wss.listen %q configured but no TLS provider", cfg.WSS.Listen)
+		}
+		if cfg.WSS.Resolved == nil {
+			return nil, fmt.Errorf("wss.listen %q has no resolved profile", cfg.WSS.Listen)
+		}
+		conf, err := e.tlsProvider.ServerConfig(*cfg.WSS.Resolved)
+		if err != nil {
+			return nil, fmt.Errorf("build wss server context: %w", err)
+		}
+		e.wssServerConf = conf
+	}
+
 	// Build one outbound TLS dialer per distinct profile. sipgo binds the outbound
 	// *tls.Config at the UserAgent (not per request), so each profile needs its own
 	// UA+Client+DialogClientCache. Endpoints naming the same profile share one dialer,
@@ -220,6 +237,19 @@ func (e *Engine) Run(ctx context.Context) error {
 	if e.tlsServerConf != nil {
 		g.Go(func() error {
 			return e.serveTLS(gctx, e.cfg.TLS.Listen, e.tlsServerConf)
+		})
+	}
+	// WebSocket listeners are additive siblings. sipgo owns the ws/wss upgrade, the
+	// sip subprotocol, and frame↔SIP; a ws-accepted request flows through the same
+	// handlers as UDP. A clean gctx cancel closes the listener and returns nil.
+	if e.cfg.WS.Listen != "" {
+		g.Go(func() error {
+			return e.srv.ListenAndServe(gctx, "ws", e.cfg.WS.Listen)
+		})
+	}
+	if e.wssServerConf != nil {
+		g.Go(func() error {
+			return e.srv.ListenAndServeTLS(gctx, "wss", e.cfg.WSS.Listen, e.wssServerConf)
 		})
 	}
 	return g.Wait()

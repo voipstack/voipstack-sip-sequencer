@@ -76,6 +76,21 @@ type TLS struct {
 	Resolved   *ResolvedTLSProfile `yaml:"-"`
 }
 
+// WS holds the optional plain WebSocket listener configuration. An empty Listen
+// disables it. It carries no tls_profile (plain transport, dev use).
+type WS struct {
+	Listen string `yaml:"listen"`
+}
+
+// WSS holds the optional secure WebSocket listener configuration. It is structurally
+// identical to TLS and reuses the same ResolvedTLSProfile model. An empty Listen
+// disables it.
+type WSS struct {
+	Listen     string              `yaml:"listen"`
+	TLSProfile string              `yaml:"tls_profile"`
+	Resolved   *ResolvedTLSProfile `yaml:"-"`
+}
+
 // TLSProfile is a named, reusable certificate + crypto/verification policy as written
 // in YAML. VerifyDepth and VerifyDates are pointers so an absent key (apply the secure
 // default) is distinguishable from an explicit value.
@@ -145,6 +160,8 @@ type NextHop struct {
 type Config struct {
 	SIP           SIP                   `yaml:"sip"`
 	TLS           TLS                   `yaml:"tls"`
+	WS            WS                    `yaml:"ws"`
+	WSS           WSS                   `yaml:"wss"`
 	NextHop       NextHop               `yaml:"next_hop"`
 	RTP           RTP                   `yaml:"rtp"`
 	Sequence      []Application         `yaml:"sequence"`
@@ -157,6 +174,8 @@ type Config struct {
 type rawConfig struct {
 	SIP           SIP                   `yaml:"sip"`
 	TLS           TLS                   `yaml:"tls"`
+	WS            WS                    `yaml:"ws"`
+	WSS           WSS                   `yaml:"wss"`
 	NextHop       *NextHop              `yaml:"next_hop"`
 	RTP           RTP                   `yaml:"rtp"`
 	Sequence      *[]Application        `yaml:"sequence"`
@@ -178,6 +197,8 @@ func Parse(data []byte, source string) (Config, error) {
 	cfg := Config{
 		SIP:           raw.SIP,
 		TLS:           raw.TLS,
+		WS:            raw.WS,
+		WSS:           raw.WSS,
 		RTP:           raw.RTP,
 		TLSProfiles:   raw.TLSProfiles,
 		LogLevel:      raw.LogLevel,
@@ -317,6 +338,25 @@ func validateTLSWiring(c Config) error {
 		}
 	}
 
+	// WebSocket listeners mirror the tls.listen wiring rules. WS is plain (no
+	// profile); WSS requires an existing tls_profile, exactly like tls.listen.
+	if c.WS.Listen != "" {
+		if _, _, err := net.SplitHostPort(c.WS.Listen); err != nil {
+			return fmt.Errorf("invalid ws.listen %q: %w", c.WS.Listen, err)
+		}
+	}
+	if c.WSS.Listen != "" {
+		if c.WSS.TLSProfile == "" {
+			return errors.New("wss.listen requires a tls_profile")
+		}
+		if _, _, err := net.SplitHostPort(c.WSS.Listen); err != nil {
+			return fmt.Errorf("invalid wss.listen %q: %w", c.WSS.Listen, err)
+		}
+		if _, ok := c.TLSProfiles[c.WSS.TLSProfile]; !ok {
+			return fmt.Errorf("wss.listen: unknown tls_profile %q", c.WSS.TLSProfile)
+		}
+	}
+
 	// Every referenced profile name must exist in tls_profiles.
 	if c.TLS.Listen != "" {
 		if _, ok := c.TLSProfiles[c.TLS.TLSProfile]; !ok {
@@ -420,6 +460,13 @@ func resolveTLS(cfg *Config) error {
 			return err
 		}
 		cfg.TLS.Resolved = r
+	}
+	if cfg.WSS.Listen != "" {
+		r, err := resolve(cfg.WSS.TLSProfile)
+		if err != nil {
+			return err
+		}
+		cfg.WSS.Resolved = r
 	}
 	for i := range cfg.Sequence {
 		if cfg.Sequence[i].Transport == TransportTLS {

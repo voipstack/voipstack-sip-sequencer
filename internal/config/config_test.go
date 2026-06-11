@@ -917,6 +917,165 @@ sequence: []
 	}
 }
 
+func TestWSAndWSSListenersParseAndResolve(t *testing.T) {
+	// Given: a config with a plain ws listener and a secure wss listener that shares
+	// the inbound tls profile
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+tls:
+  listen: "0.0.0.0:5061"
+  tls_profile: inbound
+ws:
+  listen: "0.0.0.0:8080"
+wss:
+  listen: "0.0.0.0:8443"
+  tls_profile: inbound
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+tls_profiles:
+  inbound:
+    cert: /etc/certs/in.pem
+    key: /etc/certs/in.key
+sequence: []
+`
+	// When: Parse is called
+	cfg, err := config.Parse([]byte(yaml), "test.yaml")
+
+	// Then: both blocks parse, wss resolves, and a shared profile yields one pointer
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.WS.Listen != "0.0.0.0:8080" {
+		t.Errorf("ws.listen = %q", cfg.WS.Listen)
+	}
+	if cfg.WSS.Listen != "0.0.0.0:8443" {
+		t.Errorf("wss.listen = %q", cfg.WSS.Listen)
+	}
+	if cfg.WSS.Resolved == nil {
+		t.Fatal("wss listener should resolve a profile")
+	}
+	if cfg.WSS.Resolved != cfg.TLS.Resolved {
+		t.Error("wss and tls.listen naming the same profile must share one *ResolvedTLSProfile")
+	}
+}
+
+func TestWSSListenWithoutProfileFails(t *testing.T) {
+	// Given: a wss.listen block with no tls_profile
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+wss:
+  listen: "0.0.0.0:8443"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+sequence: []
+`
+	// When/Then: parse fails
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for wss.listen without profile")
+	}
+	if !strings.Contains(err.Error(), "wss.listen requires a tls_profile") {
+		t.Errorf("error %q missing expected reason", err.Error())
+	}
+}
+
+func TestWSSUnknownProfileFails(t *testing.T) {
+	// Given: a wss.listen referencing a profile that does not exist
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+wss:
+  listen: "0.0.0.0:8443"
+  tls_profile: missing
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+sequence: []
+`
+	// When/Then: parse fails naming the unknown profile
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for unknown wss tls_profile")
+	}
+	if !strings.Contains(err.Error(), "wss.listen: unknown tls_profile") || !strings.Contains(err.Error(), "missing") {
+		t.Errorf("error %q missing endpoint/profile name", err.Error())
+	}
+}
+
+func TestWSListenInvalidHostPortFails(t *testing.T) {
+	// Given: a ws.listen that is not a valid host:port
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+ws:
+  listen: "not-a-hostport"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+sequence: []
+`
+	// When/Then: parse fails naming ws.listen
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for invalid ws.listen")
+	}
+	if !strings.Contains(err.Error(), "invalid ws.listen") {
+		t.Errorf("error %q missing expected reason", err.Error())
+	}
+}
+
+func TestWSSListenInvalidHostPortFails(t *testing.T) {
+	// Given: a wss.listen with a profile but a malformed address
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+wss:
+  listen: "not-a-hostport"
+  tls_profile: inbound
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+tls_profiles:
+  inbound:
+    cert: /etc/certs/in.pem
+    key: /etc/certs/in.key
+sequence: []
+`
+	// When/Then: parse fails naming wss.listen
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for invalid wss.listen")
+	}
+	if !strings.Contains(err.Error(), "invalid wss.listen") {
+		t.Errorf("error %q missing expected reason", err.Error())
+	}
+}
+
+func TestNoWebSocketKeysLeaveWSZeroValued(t *testing.T) {
+	// Given: a complete config with no ws/wss keys (backward compatibility)
+	cfg, err := config.Parse([]byte(completeYAML), "test.yaml")
+
+	// Then: it succeeds and both WebSocket blocks are zero-valued (disabled)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.WS.Listen != "" {
+		t.Errorf("ws.listen = %q, want empty", cfg.WS.Listen)
+	}
+	if cfg.WSS.Listen != "" || cfg.WSS.Resolved != nil {
+		t.Errorf("wss should be zero-valued, got listen=%q resolved=%v", cfg.WSS.Listen, cfg.WSS.Resolved)
+	}
+}
+
 // Compile-time check: Load exists and has the right signature.
 var _ = config.Load
 
