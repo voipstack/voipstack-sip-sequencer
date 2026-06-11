@@ -114,6 +114,17 @@ func (s *AnchorSide) close() {
 	s.rtcpConn.Close()
 }
 
+// Security reports that an AnchorSide is a plain (unencrypted) RTP leg. AnchorSide
+// thus satisfies MediaLeg, letting the engine treat plain and secured legs uniformly.
+func (s *AnchorSide) Security() MediaSecurity { return SecurityPlainRTP }
+
+// ReadRTP reads one RTP packet from the leg's RTP socket. For a plain leg the wire
+// bytes are already plaintext, so it is a direct socket read.
+func (s *AnchorSide) ReadRTP(buf []byte) (int, error) { return s.rtpConn.Read(buf) }
+
+// Close satisfies MediaLeg; it closes the leg's sockets (idempotent via the OS).
+func (s *AnchorSide) Close() { s.close() }
+
 // Tap is a media fork to one application: two AnchorSides for caller and callee directions.
 type Tap struct {
 	appName      string
@@ -129,9 +140,15 @@ func (t *Tap) close() {
 }
 
 // MediaSession relays RTP and RTCP between two anchored sides, fanning out to zero or more taps.
+//
+// endpointSide is the plain endpoint anchor. When the endpoint is a secured WebRTC
+// leg (STORY-001-019) endpointSide is nil and endpointLeg holds the secured leg
+// instead; that leg is brought up and answered, but bridging it to pbxSide is
+// STORY-001-021, so no relay runs for it yet.
 type MediaSession struct {
 	endpointSide *AnchorSide
 	pbxSide      *AnchorSide
+	endpointLeg  MediaLeg
 	tapsMu       sync.Mutex
 	taps         []*Tap
 	closeOnce    sync.Once
@@ -162,11 +179,19 @@ func (m *MediaSession) reanchor(side *AnchorSide, rtp, rtcp *net.UDPAddr) {
 	side.setRemote(rtp, rtcp)
 }
 
-// Close idempotently closes all sockets, unblocking relay goroutines.
+// Close idempotently closes all sockets and the secured endpoint leg (when present),
+// unblocking relay goroutines.
 func (m *MediaSession) Close() {
 	m.closeOnce.Do(func() {
-		m.endpointSide.close()
-		m.pbxSide.close()
+		if m.endpointSide != nil {
+			m.endpointSide.close()
+		}
+		if m.pbxSide != nil {
+			m.pbxSide.close()
+		}
+		if m.endpointLeg != nil {
+			m.endpointLeg.Close()
+		}
 		for _, t := range m.tapList() {
 			t.close()
 		}

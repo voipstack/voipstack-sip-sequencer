@@ -1076,6 +1076,68 @@ func TestNoWebSocketKeysLeaveWSZeroValued(t *testing.T) {
 	}
 }
 
+// Given: media.public_address set to a bare IP; When: Parse; Then: it loads and the
+// value is preserved (the ICE-lite host candidate address — STORY-001-019 AC6).
+func TestParseAcceptsMediaPublicAddress(t *testing.T) {
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+media:
+  public_address: "203.0.113.7"
+sequence:
+  - name: app1
+    uri: "sip:app1.example.com"
+`
+	cfg, err := config.Parse([]byte(yaml), "test.yaml")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Media.PublicAddress != "203.0.113.7" {
+		t.Errorf("media.public_address = %q, want %q", cfg.Media.PublicAddress, "203.0.113.7")
+	}
+}
+
+// Given: media.public_address carrying a port; When: Parse; Then: error — the value
+// must be a bare host/IP (the secured leg owns its own port).
+func TestParseFailsOnMediaPublicAddressWithPort(t *testing.T) {
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+media:
+  public_address: "203.0.113.7:5060"
+sequence:
+  - name: app1
+    uri: "sip:app1.example.com"
+`
+	_, err := config.Parse([]byte(yaml), "test.yaml")
+	if err == nil {
+		t.Fatal("expected error for media.public_address with a port, got nil")
+	}
+	if !strings.Contains(err.Error(), "want a bare host or IP") {
+		t.Errorf("error %q does not explain the bare-host requirement", err.Error())
+	}
+}
+
+// Given: no media key; When: Parse; Then: loads with an empty public address (the
+// engine falls back to the signaling host) — backward compatible.
+func TestParseBackwardCompatWithoutMediaPublicAddress(t *testing.T) {
+	cfg, err := config.Parse([]byte(completeYAML), "test.yaml")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Media.PublicAddress != "" {
+		t.Errorf("media.public_address = %q, want empty", cfg.Media.PublicAddress)
+	}
+}
+
 // Compile-time check: Load exists and has the right signature.
 var _ = config.Load
 

@@ -24,29 +24,31 @@ import (
 
 // Engine owns the SIP UA, UDP listener, dialog caches, and active-call registry.
 type Engine struct {
-	cfg            config.Config
-	ua             *sipgo.UserAgent
-	srv            *sipgo.Server
-	cli            *sipgo.Client
-	dialogSrvCache *sipgo.DialogServerCache
-	dialogCliCache *sipgo.DialogClientCache
-	calls          *Registry
-	metrics        MetricsSink
-	tlsProvider    tlsprov.Provider
-	tlsServerConf  *tls.Config
-	wssServerConf  *tls.Config
-	tlsDialers     map[string]*sipgo.DialogClientCache
-	tlsUAs         []*sipgo.UserAgent
-	runCtx         context.Context
-	runCancel      context.CancelFunc
-	legTimeout     time.Duration
-	ports          *PortAllocator
-	mediaHost      string
-	obsListen      string
-	obsServer      *http.Server
-	flowSecret     []byte
-	pathHost       string
-	pathPort       int
+	cfg             config.Config
+	ua              *sipgo.UserAgent
+	srv             *sipgo.Server
+	cli             *sipgo.Client
+	dialogSrvCache  *sipgo.DialogServerCache
+	dialogCliCache  *sipgo.DialogClientCache
+	calls           *Registry
+	metrics         MetricsSink
+	tlsProvider     tlsprov.Provider
+	tlsServerConf   *tls.Config
+	wssServerConf   *tls.Config
+	tlsDialers      map[string]*sipgo.DialogClientCache
+	tlsUAs          []*sipgo.UserAgent
+	runCtx          context.Context
+	runCancel       context.CancelFunc
+	legTimeout      time.Duration
+	ports           *PortAllocator
+	mediaHost       string
+	mediaPublicAddr string
+	webrtcFactory   WebRTCFactory
+	obsListen       string
+	obsServer       *http.Server
+	flowSecret      []byte
+	pathHost        string
+	pathPort        int
 }
 
 // Option customizes an Engine at construction. Options are applied after defaults,
@@ -56,6 +58,13 @@ type Option func(*Engine)
 // WithMetrics installs a MetricsSink, replacing the default noopMetrics.
 func WithMetrics(s MetricsSink) Option {
 	return func(e *Engine) { e.metrics = s }
+}
+
+// WithWebRTCFactory installs the WebRTCFactory used to build secured (DTLS-SRTP)
+// endpoint legs, replacing the default pion-backed factory. Tests inject a fake so
+// the secured-leg wiring can be exercised without a real WebRTC stack.
+func WithWebRTCFactory(f WebRTCFactory) Option {
+	return func(e *Engine) { e.webrtcFactory = f }
 }
 
 // WithTLSProvider installs the TLS Provider so TLS listeners and dialers
@@ -108,23 +117,32 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 		Address: sip.Uri{Host: host, Port: port},
 	}
 
+	// The ICE-lite host candidate is advertised at the configured public media
+	// address; when unset it falls back to the signaling host (dev/local).
+	mediaPublicAddr := cfg.Media.PublicAddress
+	if mediaPublicAddr == "" {
+		mediaPublicAddr = host
+	}
+
 	e := &Engine{
-		cfg:            cfg,
-		ua:             ua,
-		srv:            srv,
-		cli:            cli,
-		dialogSrvCache: sipgo.NewDialogServerCache(cli, contactHDR),
-		dialogCliCache: sipgo.NewDialogClientCache(cli, contactHDR),
-		calls:          &Registry{m: make(map[string]*Call), byDialog: make(map[string]*Call)},
-		metrics:        noopMetrics{},
-		tlsDialers:     map[string]*sipgo.DialogClientCache{},
-		legTimeout:     32 * time.Second,
-		ports:          newPortAllocator(portMin, portMax),
-		mediaHost:      host,
-		obsListen:      cfg.Observability.Listen,
-		flowSecret:     flowSecret,
-		pathHost:       host,
-		pathPort:       port,
+		cfg:             cfg,
+		ua:              ua,
+		srv:             srv,
+		cli:             cli,
+		dialogSrvCache:  sipgo.NewDialogServerCache(cli, contactHDR),
+		dialogCliCache:  sipgo.NewDialogClientCache(cli, contactHDR),
+		calls:           &Registry{m: make(map[string]*Call), byDialog: make(map[string]*Call)},
+		metrics:         noopMetrics{},
+		tlsDialers:      map[string]*sipgo.DialogClientCache{},
+		legTimeout:      32 * time.Second,
+		ports:           newPortAllocator(portMin, portMax),
+		mediaHost:       host,
+		mediaPublicAddr: mediaPublicAddr,
+		webrtcFactory:   pionFactory{},
+		obsListen:       cfg.Observability.Listen,
+		flowSecret:      flowSecret,
+		pathHost:        host,
+		pathPort:        port,
 	}
 	for _, opt := range opts {
 		opt(e)

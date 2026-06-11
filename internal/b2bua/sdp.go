@@ -42,6 +42,30 @@ func extractAudioCodecs(callOffer []byte) (formats string, rtpmaps, fmtps []stri
 	return formats, rtpmaps, fmtps, nil
 }
 
+// offerIsWebRTC reports whether an SDP offer is a WebRTC (DTLS-SRTP) offer rather
+// than a plain RTP/AVP offer. A browser offer uses a secure profile (RTP/SAVPF or
+// RTP/SAVP) on its m=audio line and carries a DTLS a=fingerprint; either signal is
+// sufficient. Plain RTP/AVP offers (no fingerprint) return false, so the plain
+// anchoring path is untouched. Pure; CRLF-tolerant.
+func offerIsWebRTC(sdp []byte) bool {
+	for _, rawLine := range bytes.Split(sdp, []byte("\n")) {
+		line := strings.TrimRight(string(rawLine), "\r")
+		if strings.HasPrefix(line, "m=audio ") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 {
+				proto := fields[2]
+				if strings.Contains(proto, "SAVPF") || strings.Contains(proto, "SAVP") {
+					return true
+				}
+			}
+		}
+		if strings.HasPrefix(line, "a=fingerprint:") {
+			return true
+		}
+	}
+	return false
+}
+
 // buildTapOffer builds a minimal SDP offer with two recvonly m=audio blocks.
 // Stream 1 (rtpPort1) = caller direction; stream 2 (rtpPort2) = callee direction.
 // Codec list is copied verbatim from callOffer.

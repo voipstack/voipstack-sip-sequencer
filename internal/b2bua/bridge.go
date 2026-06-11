@@ -121,6 +121,18 @@ func (e *Engine) bridge(ctx context.Context, call *Call) {
 	if !ok {
 		return
 	}
+
+	// A webphone (WebRTC) endpoint is brought up and answered directly: the secured
+	// leg is the deliverable (STORY-001-019). Dialing the PBX and bridging the secured
+	// leg to it is STORY-001-021, so no PBX dial and no relay run here.
+	if anchor.securedLeg != nil {
+		if !e.answerSecuredEndpoint(call, anchor, start) {
+			return
+		}
+		<-ctx.Done()
+		return
+	}
+
 	if !e.dialPBX(ctx, call, anchor, start) {
 		return
 	}
@@ -373,12 +385,14 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 }
 
 // mediaAnchor carries the anchored media state the PBX phase needs after the
-// endpoint-facing anchor is established.
+// endpoint-facing anchor is established. securedLeg is set only when the endpoint is
+// a WebRTC (DTLS-SRTP) leg, in which case the plain pbxSide/epPair fields are unused.
 type mediaAnchor struct {
-	session *MediaSession
-	pbxSide *AnchorSide
-	epPair  PortPair
-	pbxPair PortPair
+	session    *MediaSession
+	pbxSide    *AnchorSide
+	epPair     PortPair
+	pbxPair    PortPair
+	securedLeg *SecuredLeg
 }
 
 // anchorMedia parses the inbound offer, acquires and binds the endpoint- and
@@ -386,6 +400,12 @@ type mediaAnchor struct {
 // session (with its teardown release hook) on the call. It returns false when a
 // failure aborts the call (final response already sent, call torn down).
 func (e *Engine) anchorMedia(call *Call) (mediaAnchor, bool) {
+	// A webphone offers WebRTC media; its endpoint leg is a secured (DTLS-SRTP)
+	// endpoint rather than a plain anchor. The plain path below is untouched.
+	if offerIsWebRTC(call.inbound.offerSDP) {
+		return e.anchorWebRTC(call)
+	}
+
 	epHost, epPort, err := parseMedia(call.inbound.offerSDP)
 	if err != nil {
 		slog.Error("parse inbound SDP", "err", err)
@@ -448,6 +468,64 @@ func (e *Engine) anchorMedia(call *Call) (mediaAnchor, bool) {
 	call.mu.Unlock()
 
 	return mediaAnchor{session: mediaSess, pbxSide: pbxSide, epPair: epPair, pbxPair: pbxPair}, true
+}
+
+// anchorWebRTC brings up the secured (DTLS-SRTP) endpoint leg for a webphone's WebRTC
+// offer: it builds the leg via the WebRTC factory (which answers ICE-lite, gathers a
+// host candidate on the configured public address, and terminates DTLS-SRTP), and
+// registers it on a MediaSession so teardown unwinds the pion endpoint. It binds no
+// RTP port pair (pion owns its own port) and no PBX side — dialing the PBX and
+// bridging is STORY-001-021. It returns false when setup fails (final response sent,
+// call torn down).
+func (e *Engine) anchorWebRTC(call *Call) (mediaAnchor, bool) {
+	leg, err := newSecuredLeg(e.webrtcFactory, e.mediaPublicAddr, call.inbound.offerSDP)
+	if err != nil {
+		slog.Error("bring up webrtc endpoint leg", "err", err)
+		e.fail(call, 488, "Not Acceptable Here", "webrtc endpoint setup failed")
+		return mediaAnchor{}, false
+	}
+
+	mediaSess := &MediaSession{endpointLeg: leg}
+	ports := e.ports
+	call.mu.Lock()
+	call.media = mediaSess
+	call.releaseMedia = func() {
+		mediaSess.Close()
+		for _, t := range mediaSess.tapList() {
+			ports.Release(t.callerPair)
+			ports.Release(t.calleePair)
+		}
+	}
+	call.mu.Unlock()
+
+	return mediaAnchor{session: mediaSess, securedLeg: leg}, true
+}
+
+// answerSecuredEndpoint answers the webphone with the secured leg's ICE-lite/DTLS-SRTP
+// SDP, marks the call established, and registers the stashed taps. It returns false
+// when answering fails (call torn down).
+func (e *Engine) answerSecuredEndpoint(call *Call, anchor mediaAnchor, start time.Time) bool {
+	answerSDP := anchor.securedLeg.AnswerSDP()
+	if err := call.inbound.session.Respond(200, "OK", answerSDP); err != nil {
+		slog.Error("answer webphone endpoint", "err", err)
+		releasePendingTaps(call, e.ports)
+		call.teardown("answer webphone endpoint failed")
+		return false
+	}
+
+	e.metrics.ObserveSequencingLatency(time.Since(start))
+
+	call.mu.Lock()
+	if canTransition(call.state, stateEstablished) {
+		call.state = stateEstablished
+	}
+	for _, pt := range call.pendingTaps {
+		anchor.session.addTap(pt.tap)
+	}
+	call.pendingTaps = nil
+	call.mu.Unlock()
+
+	return true
 }
 
 // dialPBX originates the terminating PBX leg, anchors the PBX-side media from its

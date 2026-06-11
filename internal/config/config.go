@@ -130,6 +130,13 @@ type RTP struct {
 	PortRange string `yaml:"port_range"`
 }
 
+// Media holds media-anchoring configuration. PublicAddress is the publicly
+// reachable address the secured (WebRTC/ICE-lite) leg advertises as its host
+// candidate. An empty value lets the engine fall back to the signaling host.
+type Media struct {
+	PublicAddress string `yaml:"public_address"`
+}
+
 // Observability holds the optional metrics/health HTTP listener configuration.
 // An empty Listen disables observability (no HTTP server).
 type Observability struct {
@@ -164,6 +171,7 @@ type Config struct {
 	WSS           WSS                   `yaml:"wss"`
 	NextHop       NextHop               `yaml:"next_hop"`
 	RTP           RTP                   `yaml:"rtp"`
+	Media         Media                 `yaml:"media"`
 	Sequence      []Application         `yaml:"sequence"`
 	TLSProfiles   map[string]TLSProfile `yaml:"tls_profiles"`
 	LogLevel      LogLevel              `yaml:"log_level"`
@@ -178,6 +186,7 @@ type rawConfig struct {
 	WSS           WSS                   `yaml:"wss"`
 	NextHop       *NextHop              `yaml:"next_hop"`
 	RTP           RTP                   `yaml:"rtp"`
+	Media         Media                 `yaml:"media"`
 	Sequence      *[]Application        `yaml:"sequence"`
 	TLSProfiles   map[string]TLSProfile `yaml:"tls_profiles"`
 	LogLevel      LogLevel              `yaml:"log_level"`
@@ -200,6 +209,7 @@ func Parse(data []byte, source string) (Config, error) {
 		WS:            raw.WS,
 		WSS:           raw.WSS,
 		RTP:           raw.RTP,
+		Media:         raw.Media,
 		TLSProfiles:   raw.TLSProfiles,
 		LogLevel:      raw.LogLevel,
 		Observability: raw.Observability,
@@ -277,6 +287,13 @@ func validate(c Config, sequencePresent, nextHopPresent bool) error {
 	if c.Observability.Listen != "" {
 		if _, _, err := net.SplitHostPort(c.Observability.Listen); err != nil {
 			return fmt.Errorf("invalid observability.listen %q: %w", c.Observability.Listen, err)
+		}
+	}
+	// media.public_address, when set, is a bare host/IP advertised as the ICE-lite
+	// host candidate — it must not carry a port (the secured leg owns its own port).
+	if c.Media.PublicAddress != "" {
+		if _, _, err := net.SplitHostPort(c.Media.PublicAddress); err == nil {
+			return fmt.Errorf("media.public_address %q: want a bare host or IP", c.Media.PublicAddress)
 		}
 	}
 	for i, app := range c.Sequence {
