@@ -2,6 +2,7 @@ package b2bua
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -43,6 +44,9 @@ type Engine struct {
 	mediaHost      string
 	obsListen      string
 	obsServer      *http.Server
+	flowSecret     []byte
+	pathHost       string
+	pathPort       int
 }
 
 // Option customizes an Engine at construction. Options are applied after defaults,
@@ -92,6 +96,14 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 		return nil, fmt.Errorf("create SIP client: %w", err)
 	}
 
+	// flowSecret signs the Path flow token (RFC 3327). It lives for the process only:
+	// a restart invalidates outstanding tokens, and webphones re-register for a fresh
+	// Path. It is never logged.
+	flowSecret := make([]byte, 32)
+	if _, err := rand.Read(flowSecret); err != nil {
+		return nil, fmt.Errorf("generate flow secret: %w", err)
+	}
+
 	contactHDR := sip.ContactHeader{
 		Address: sip.Uri{Host: host, Port: port},
 	}
@@ -110,6 +122,9 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 		ports:          newPortAllocator(portMin, portMax),
 		mediaHost:      host,
 		obsListen:      cfg.Observability.Listen,
+		flowSecret:     flowSecret,
+		pathHost:       host,
+		pathPort:       port,
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -220,6 +235,9 @@ func (e *Engine) Run(ctx context.Context) error {
 		_ = tx.Respond(res)
 	})
 	e.srv.OnRefer(e.handleRefer)
+	// REGISTER is intercepted at the registration edge: record the flow, insert a
+	// Path, forward to the registrar. It must not fall through to OnNoRoute.
+	e.srv.OnRegister(e.handleRegister)
 	// All methods not explicitly managed above are forwarded to cfg.NextHop.
 	e.srv.OnNoRoute(e.proxyUnmanaged)
 

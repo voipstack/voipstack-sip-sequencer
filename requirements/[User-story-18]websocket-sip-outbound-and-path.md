@@ -17,10 +17,20 @@ Outbound** (RFC 5626): they send `REGISTER` with `;ob`, a **reg-id**, and a
 request to reach that webphone later, the sequencer must remember the flow the
 registration arrived on and route the request back over it — which requires
 inserting a **Path** header (RFC 3327) at the WebSocket edge so the registrar's
-binding records the route back through this sequencer. The flow is held open with
-RFC 5626 CRLF keep-alives (in addition to WebSocket ping/pong from
-`[STORY-001-017]`), and subsequent requests reuse the existing flow rather than
-opening a new connection.
+binding records the route back through this sequencer. The flow is held open by the
+persistent WebSocket/TCP connection, and subsequent requests reuse that existing
+flow rather than opening a new connection.
+
+> **Decided assumptions / limitations:**
+> - **`next_hop` supports RFC 3327 Path** — the upstream registrar behind `next_hop`
+>   honors the Path header the sequencer inserts and reflects it into the inbound
+>   request's Route. Inbound routing back to the webphone depends on this.
+> - **sipgo used as-is** (see [STORY-001-017]) — sipgo answers no RFC 5626 CRLF
+>   keep-alive (nor WebSocket ping/pong). The flow stays open via the persistent
+>   ws/TCP connection itself, not a server-sent keep-alive response. AC4 is scoped
+>   accordingly.
+> - **Flow token must be integrity-protected** (HMAC-signed) so a forged Route
+>   cannot make the sequencer forward to an arbitrary internal address.
 
 Key points:
 - Business value: webphones stay reachable for inbound calls through their single
@@ -59,7 +69,8 @@ Key points:
   outbound flow.
 - Reuse the existing flow for subsequent requests from the same webphone instead of
   opening a new connection.
-- Maintain the flow with RFC 5626 CRLF keep-alives.
+- Keep the flow usable for as long as its WebSocket/TCP connection persists (no
+  server-sent keep-alive; tolerate client CRLF keep-alives).
 
 ### Scope Out
 - The WebSocket transport itself and WS ping/pong keep-alive — `[STORY-001-017]`.
@@ -90,12 +101,13 @@ webphone having opened any new connection.
 **Then** they travel over the same flow and the sequencer does not open a new
 connection to the webphone.
 
-#### AC4: CRLF keep-alive holds the flow open
-**Given** a registered webphone that sends RFC 5626 CRLF keep-alives over an
-otherwise-idle flow
-**When** the idle period elapses
-**Then** the flow is kept open and the webphone remains reachable for inbound
-calls.
+#### AC4: The flow stays open while the connection persists
+**Given** a registered webphone whose WebSocket flow is otherwise idle
+**When** the idle period elapses while the WebSocket/TCP connection remains open
+**Then** the flow is still usable and the webphone remains reachable for inbound
+calls. (The sequencer relies on the persistent connection; per the as-is sipgo
+decision it does not answer RFC 5626 CRLF keep-alives — clients may still send them
+harmlessly.)
 
 #### AC5: A webphone re-registers over a new flow after reconnect
 **Given** a webphone whose WebSocket flow has dropped (network loss)

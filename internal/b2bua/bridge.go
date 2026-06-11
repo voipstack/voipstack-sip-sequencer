@@ -50,6 +50,13 @@ func dialContext(parent context.Context, rp *config.ResolvedTLSProfile) (context
 // DialogStateEnded → teardown — cancelling callCtx before the bridge can send
 // anything. Running bridge() synchronously here prevents that race.
 func (e *Engine) handleInvite(req *sip.Request, tx sip.ServerTransaction) {
+	// An inbound request whose top Route is this sequencer's Path with a valid flow
+	// token is routed back to the webphone over its existing flow, not bridged as a
+	// new caller. A normal caller INVITE has no self-Route and is unaffected.
+	if e.routeToFlow(req, tx) {
+		return
+	}
+
 	// Check for an in-dialog re-INVITE before touching the initial-INVITE path.
 	if existingDSS, matchErr := e.dialogSrvCache.MatchDialogRequest(req); matchErr == nil {
 		call, ok := e.calls.getByDialog(existingDSS.ID)
