@@ -3,8 +3,8 @@ package tlsprov
 import "github.com/voipstack/voipstack-sip-sequencer/internal/config"
 
 // LoadAll eagerly loads every resolved tls_profile referenced by cfg — the inbound
-// TLS listener, each sequence application, and the next hop — so an unloadable
-// certificate aborts startup before any listener binds. It returns the first load
+// TLS listener, the inbound WSS listener, each sequence application, and the next
+// hop — so an unloadable certificate aborts startup before any listener binds. It returns the first load
 // error (already audit-logged). A config with no TLS profiles is a no-op.
 //
 // Deduplication is handled by the provider cache, so passing the same profile/path
@@ -12,6 +12,7 @@ import "github.com/voipstack/voipstack-sip-sequencer/internal/config"
 func LoadAll(cfg config.Config, p Provider) error {
 	var profiles []*config.ResolvedTLSProfile
 	profiles = append(profiles, cfg.TLS.Resolved)
+	profiles = append(profiles, cfg.WSS.Resolved)
 	for i := range cfg.Sequence {
 		profiles = append(profiles, cfg.Sequence[i].Resolved)
 	}

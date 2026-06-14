@@ -2,6 +2,7 @@ package b2bua
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -23,25 +24,31 @@ import (
 
 // Engine owns the SIP UA, UDP listener, dialog caches, and active-call registry.
 type Engine struct {
-	cfg            config.Config
-	ua             *sipgo.UserAgent
-	srv            *sipgo.Server
-	cli            *sipgo.Client
-	dialogSrvCache *sipgo.DialogServerCache
-	dialogCliCache *sipgo.DialogClientCache
-	calls          *Registry
-	metrics        MetricsSink
-	tlsProvider    tlsprov.Provider
-	tlsServerConf  *tls.Config
-	tlsDialers     map[string]*sipgo.DialogClientCache
-	tlsUAs         []*sipgo.UserAgent
-	runCtx         context.Context
-	runCancel      context.CancelFunc
-	legTimeout     time.Duration
-	ports          *PortAllocator
-	mediaHost      string
-	obsListen      string
-	obsServer      *http.Server
+	cfg             config.Config
+	ua              *sipgo.UserAgent
+	srv             *sipgo.Server
+	cli             *sipgo.Client
+	dialogSrvCache  *sipgo.DialogServerCache
+	dialogCliCache  *sipgo.DialogClientCache
+	calls           *Registry
+	metrics         MetricsSink
+	tlsProvider     tlsprov.Provider
+	tlsServerConf   *tls.Config
+	wssServerConf   *tls.Config
+	tlsDialers      map[string]*sipgo.DialogClientCache
+	tlsUAs          []*sipgo.UserAgent
+	runCtx          context.Context
+	runCancel       context.CancelFunc
+	legTimeout      time.Duration
+	ports           *PortAllocator
+	mediaHost       string
+	mediaPublicAddr string
+	webrtcFactory   WebRTCFactory
+	obsListen       string
+	obsServer       *http.Server
+	flowSecret      []byte
+	pathHost        string
+	pathPort        int
 }
 
 // Option customizes an Engine at construction. Options are applied after defaults,
@@ -51,6 +58,13 @@ type Option func(*Engine)
 // WithMetrics installs a MetricsSink, replacing the default noopMetrics.
 func WithMetrics(s MetricsSink) Option {
 	return func(e *Engine) { e.metrics = s }
+}
+
+// WithWebRTCFactory installs the WebRTCFactory used to build secured (DTLS-SRTP)
+// endpoint legs, replacing the default pion-backed factory. Tests inject a fake so
+// the secured-leg wiring can be exercised without a real WebRTC stack.
+func WithWebRTCFactory(f WebRTCFactory) Option {
+	return func(e *Engine) { e.webrtcFactory = f }
 }
 
 // WithTLSProvider installs the TLS Provider so TLS listeners and dialers
@@ -91,24 +105,44 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 		return nil, fmt.Errorf("create SIP client: %w", err)
 	}
 
+	// flowSecret signs the Path flow token (RFC 3327). It lives for the process only:
+	// a restart invalidates outstanding tokens, and webphones re-register for a fresh
+	// Path. It is never logged.
+	flowSecret := make([]byte, 32)
+	if _, err := rand.Read(flowSecret); err != nil {
+		return nil, fmt.Errorf("generate flow secret: %w", err)
+	}
+
 	contactHDR := sip.ContactHeader{
 		Address: sip.Uri{Host: host, Port: port},
 	}
 
+	// The ICE-lite host candidate is advertised at the configured public media
+	// address; when unset it falls back to the signaling host (dev/local).
+	mediaPublicAddr := cfg.Media.PublicAddress
+	if mediaPublicAddr == "" {
+		mediaPublicAddr = host
+	}
+
 	e := &Engine{
-		cfg:            cfg,
-		ua:             ua,
-		srv:            srv,
-		cli:            cli,
-		dialogSrvCache: sipgo.NewDialogServerCache(cli, contactHDR),
-		dialogCliCache: sipgo.NewDialogClientCache(cli, contactHDR),
-		calls:          &Registry{m: make(map[string]*Call), byDialog: make(map[string]*Call)},
-		metrics:        noopMetrics{},
-		tlsDialers:     map[string]*sipgo.DialogClientCache{},
-		legTimeout:     32 * time.Second,
-		ports:          newPortAllocator(portMin, portMax),
-		mediaHost:      host,
-		obsListen:      cfg.Observability.Listen,
+		cfg:             cfg,
+		ua:              ua,
+		srv:             srv,
+		cli:             cli,
+		dialogSrvCache:  sipgo.NewDialogServerCache(cli, contactHDR),
+		dialogCliCache:  sipgo.NewDialogClientCache(cli, contactHDR),
+		calls:           &Registry{m: make(map[string]*Call), byDialog: make(map[string]*Call)},
+		metrics:         noopMetrics{},
+		tlsDialers:      map[string]*sipgo.DialogClientCache{},
+		legTimeout:      32 * time.Second,
+		ports:           newPortAllocator(portMin, portMax),
+		mediaHost:       host,
+		mediaPublicAddr: mediaPublicAddr,
+		webrtcFactory:   pionFactory{},
+		obsListen:       cfg.Observability.Listen,
+		flowSecret:      flowSecret,
+		pathHost:        host,
+		pathPort:        port,
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -128,6 +162,22 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 			return nil, fmt.Errorf("build tls server context: %w", err)
 		}
 		e.tlsServerConf = conf
+	}
+
+	// Build the inbound WSS server context the same way (fail-fast), mirroring the
+	// tls.listen block. WSS reuses the audited TLS profile model verbatim.
+	if cfg.WSS.Listen != "" {
+		if e.tlsProvider == nil {
+			return nil, fmt.Errorf("wss.listen %q configured but no TLS provider", cfg.WSS.Listen)
+		}
+		if cfg.WSS.Resolved == nil {
+			return nil, fmt.Errorf("wss.listen %q has no resolved profile", cfg.WSS.Listen)
+		}
+		conf, err := e.tlsProvider.ServerConfig(*cfg.WSS.Resolved)
+		if err != nil {
+			return nil, fmt.Errorf("build wss server context: %w", err)
+		}
+		e.wssServerConf = conf
 	}
 
 	// Build one outbound TLS dialer per distinct profile. sipgo binds the outbound
@@ -203,6 +253,12 @@ func (e *Engine) Run(ctx context.Context) error {
 		_ = tx.Respond(res)
 	})
 	e.srv.OnRefer(e.handleRefer)
+	// REGISTER is intercepted at the registration edge: record the flow, insert a
+	// Path, forward to the registrar. It must not fall through to OnNoRoute.
+	e.srv.OnRegister(e.handleRegister)
+	// INFO is intercepted to consume trickle-ICE candidates on a secured webphone
+	// dialog (RFC 8840); every other INFO is proxied to cfg.NextHop unchanged.
+	e.srv.OnInfo(e.handleInfo)
 	// All methods not explicitly managed above are forwarded to cfg.NextHop.
 	e.srv.OnNoRoute(e.proxyUnmanaged)
 
@@ -220,6 +276,19 @@ func (e *Engine) Run(ctx context.Context) error {
 	if e.tlsServerConf != nil {
 		g.Go(func() error {
 			return e.serveTLS(gctx, e.cfg.TLS.Listen, e.tlsServerConf)
+		})
+	}
+	// WebSocket listeners are additive siblings. sipgo owns the ws/wss upgrade, the
+	// sip subprotocol, and frame↔SIP; a ws-accepted request flows through the same
+	// handlers as UDP. A clean gctx cancel closes the listener and returns nil.
+	if e.cfg.WS.Listen != "" {
+		g.Go(func() error {
+			return e.srv.ListenAndServe(gctx, "ws", e.cfg.WS.Listen)
+		})
+	}
+	if e.wssServerConf != nil {
+		g.Go(func() error {
+			return e.srv.ListenAndServeTLS(gctx, "wss", e.cfg.WSS.Listen, e.wssServerConf)
 		})
 	}
 	return g.Wait()

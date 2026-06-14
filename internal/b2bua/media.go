@@ -114,6 +114,41 @@ func (s *AnchorSide) close() {
 	s.rtcpConn.Close()
 }
 
+// Security reports that an AnchorSide is a plain (unencrypted) RTP leg. AnchorSide
+// thus satisfies MediaLeg, letting the engine treat plain and secured legs uniformly.
+func (s *AnchorSide) Security() MediaSecurity { return SecurityPlainRTP }
+
+// ReadRTP reads one RTP packet from the leg's RTP socket. For a plain leg the wire
+// bytes are already plaintext, so it is a direct socket read.
+func (s *AnchorSide) ReadRTP(buf []byte) (int, error) { return s.rtpConn.Read(buf) }
+
+// WriteRTP sends one plaintext RTP packet to the leg's current remote. For a plain leg
+// the wire bytes are the plaintext, so it is a direct socket write. A nil remote (not
+// yet negotiated, or held) drops the packet silently, matching copyUDP semantics.
+func (s *AnchorSide) WriteRTP(pkt []byte) (int, error) {
+	dst := s.loadRemoteRTP()
+	if dst == nil {
+		return len(pkt), nil
+	}
+	return s.rtpConn.WriteTo(pkt, dst)
+}
+
+// ReadRTCP reads one RTCP packet from the leg's RTCP socket (plaintext for a plain leg).
+func (s *AnchorSide) ReadRTCP(buf []byte) (int, error) { return s.rtcpConn.Read(buf) }
+
+// WriteRTCP sends one plaintext RTCP packet to the leg's current RTCP remote. A nil
+// remote drops the packet silently.
+func (s *AnchorSide) WriteRTCP(pkt []byte) (int, error) {
+	dst := s.loadRemoteRTCP()
+	if dst == nil {
+		return len(pkt), nil
+	}
+	return s.rtcpConn.WriteTo(pkt, dst)
+}
+
+// Close satisfies MediaLeg; it closes the leg's sockets (idempotent via the OS).
+func (s *AnchorSide) Close() { s.close() }
+
 // Tap is a media fork to one application: two AnchorSides for caller and callee directions.
 type Tap struct {
 	appName      string
@@ -129,9 +164,15 @@ func (t *Tap) close() {
 }
 
 // MediaSession relays RTP and RTCP between two anchored sides, fanning out to zero or more taps.
+//
+// endpointSide is the plain endpoint anchor. When the endpoint is a secured WebRTC
+// leg (STORY-001-019) endpointSide is nil and endpointLeg holds the secured leg
+// instead; that leg is brought up and answered, but bridging it to pbxSide is
+// STORY-001-021, so no relay runs for it yet.
 type MediaSession struct {
 	endpointSide *AnchorSide
 	pbxSide      *AnchorSide
+	endpointLeg  MediaLeg
 	tapsMu       sync.Mutex
 	taps         []*Tap
 	closeOnce    sync.Once
@@ -162,11 +203,19 @@ func (m *MediaSession) reanchor(side *AnchorSide, rtp, rtcp *net.UDPAddr) {
 	side.setRemote(rtp, rtcp)
 }
 
-// Close idempotently closes all sockets, unblocking relay goroutines.
+// Close idempotently closes all sockets and the secured endpoint leg (when present),
+// unblocking relay goroutines.
 func (m *MediaSession) Close() {
 	m.closeOnce.Do(func() {
-		m.endpointSide.close()
-		m.pbxSide.close()
+		if m.endpointSide != nil {
+			m.endpointSide.close()
+		}
+		if m.pbxSide != nil {
+			m.pbxSide.close()
+		}
+		if m.endpointLeg != nil {
+			m.endpointLeg.Close()
+		}
 		for _, t := range m.tapList() {
 			t.close()
 		}
@@ -258,6 +307,115 @@ func copyUDPFanout(ctx context.Context, readConn, writeConn *net.UDPConn, primar
 					slog.Debug("tap write", "app", tap.localRTPPort, "err", err)
 				}
 			}
+		}
+	}
+}
+
+// bridgeLegs relays decrypted RTP and RTCP between two media legs in both directions,
+// fanning RTP out to taps as plaintext. It is security-agnostic: each leg's ReadRTP/
+// WriteRTP (and RTCP mirrors) applies that leg's own on-the-wire security, so the relay
+// only ever moves plaintext and never references SRTP or MediaSecurity. Making the
+// opposite leg SRTP later (SRTP↔SRTP) therefore requires no change here. callerTaps
+// receive the a→b direction, calleeTaps the b→a direction. Returns when ctx is
+// cancelled or a leg is closed.
+func (m *MediaSession) bridgeLegs(ctx context.Context, a, b MediaLeg, callerTaps, calleeTaps []*AnchorSide) {
+	var wg sync.WaitGroup
+	wg.Add(4)
+
+	// RTP a→b (e.g. webphone → PBX), fanning out to caller-direction taps.
+	go func() {
+		defer wg.Done()
+		copyLegRTP(ctx, a, b, callerTaps)
+	}()
+	// RTP b→a (e.g. PBX → webphone), fanning out to callee-direction taps.
+	go func() {
+		defer wg.Done()
+		copyLegRTP(ctx, b, a, calleeTaps)
+	}()
+	// RTCP a→b.
+	go func() {
+		defer wg.Done()
+		copyLegRTCP(ctx, a, b)
+	}()
+	// RTCP b→a.
+	go func() {
+		defer wg.Done()
+		copyLegRTCP(ctx, b, a)
+	}()
+
+	<-ctx.Done()
+	m.Close()
+	wg.Wait()
+}
+
+// copyLegRTP reads one decrypted RTP packet from src, writes it to dst (which applies
+// dst's outbound security), then fans the plaintext out to each tap's RTP socket. A
+// read or write error logs at debug and stops this direction only — best-effort,
+// call-isolated. Tap write errors are logged and skipped, never blocking the primary.
+func copyLegRTP(ctx context.Context, src, dst MediaLeg, tapSides []*AnchorSide) {
+	buf := make([]byte, rtpBufSize)
+	for {
+		n, err := src.ReadRTP(buf)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+			default:
+				slog.Debug("bridge read rtp", "err", err)
+			}
+			return
+		}
+		pkt := buf[:n]
+
+		if _, err := dst.WriteRTP(pkt); err != nil {
+			select {
+			case <-ctx.Done():
+			default:
+				slog.Debug("bridge write rtp", "err", err)
+			}
+			return
+		}
+
+		for _, tap := range tapSides {
+			if tap == nil {
+				continue
+			}
+			tapDst := tap.loadRemoteRTP()
+			if tapDst == nil {
+				continue
+			}
+			if _, err := tap.rtpConn.WriteTo(pkt, tapDst); err != nil {
+				select {
+				case <-ctx.Done():
+				default:
+					slog.Debug("tap write", "app", tap.localRTPPort, "err", err)
+				}
+			}
+		}
+	}
+}
+
+// copyLegRTCP reads one decrypted RTCP packet from src and writes it to dst, applying
+// dst's outbound security. A read or write error logs at debug and stops this direction
+// only — best-effort, call-isolated.
+func copyLegRTCP(ctx context.Context, src, dst MediaLeg) {
+	buf := make([]byte, rtpBufSize)
+	for {
+		n, err := src.ReadRTCP(buf)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+			default:
+				slog.Debug("bridge read rtcp", "err", err)
+			}
+			return
+		}
+		if _, err := dst.WriteRTCP(buf[:n]); err != nil {
+			select {
+			case <-ctx.Done():
+			default:
+				slog.Debug("bridge write rtcp", "err", err)
+			}
+			return
 		}
 	}
 }

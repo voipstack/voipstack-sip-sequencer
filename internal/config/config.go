@@ -76,6 +76,21 @@ type TLS struct {
 	Resolved   *ResolvedTLSProfile `yaml:"-"`
 }
 
+// WS holds the optional plain WebSocket listener configuration. An empty Listen
+// disables it. It carries no tls_profile (plain transport, dev use).
+type WS struct {
+	Listen string `yaml:"listen"`
+}
+
+// WSS holds the optional secure WebSocket listener configuration. It is structurally
+// identical to TLS and reuses the same ResolvedTLSProfile model. An empty Listen
+// disables it.
+type WSS struct {
+	Listen     string              `yaml:"listen"`
+	TLSProfile string              `yaml:"tls_profile"`
+	Resolved   *ResolvedTLSProfile `yaml:"-"`
+}
+
 // TLSProfile is a named, reusable certificate + crypto/verification policy as written
 // in YAML. VerifyDepth and VerifyDates are pointers so an absent key (apply the secure
 // default) is distinguishable from an explicit value.
@@ -115,6 +130,13 @@ type RTP struct {
 	PortRange string `yaml:"port_range"`
 }
 
+// Media holds media-anchoring configuration. PublicAddress is the publicly
+// reachable address the secured (WebRTC/ICE-lite) leg advertises as its host
+// candidate. An empty value lets the engine fall back to the signaling host.
+type Media struct {
+	PublicAddress string `yaml:"public_address"`
+}
+
 // Observability holds the optional metrics/health HTTP listener configuration.
 // An empty Listen disables observability (no HTTP server).
 type Observability struct {
@@ -145,8 +167,11 @@ type NextHop struct {
 type Config struct {
 	SIP           SIP                   `yaml:"sip"`
 	TLS           TLS                   `yaml:"tls"`
+	WS            WS                    `yaml:"ws"`
+	WSS           WSS                   `yaml:"wss"`
 	NextHop       NextHop               `yaml:"next_hop"`
 	RTP           RTP                   `yaml:"rtp"`
+	Media         Media                 `yaml:"media"`
 	Sequence      []Application         `yaml:"sequence"`
 	TLSProfiles   map[string]TLSProfile `yaml:"tls_profiles"`
 	LogLevel      LogLevel              `yaml:"log_level"`
@@ -157,8 +182,11 @@ type Config struct {
 type rawConfig struct {
 	SIP           SIP                   `yaml:"sip"`
 	TLS           TLS                   `yaml:"tls"`
+	WS            WS                    `yaml:"ws"`
+	WSS           WSS                   `yaml:"wss"`
 	NextHop       *NextHop              `yaml:"next_hop"`
 	RTP           RTP                   `yaml:"rtp"`
+	Media         Media                 `yaml:"media"`
 	Sequence      *[]Application        `yaml:"sequence"`
 	TLSProfiles   map[string]TLSProfile `yaml:"tls_profiles"`
 	LogLevel      LogLevel              `yaml:"log_level"`
@@ -178,7 +206,10 @@ func Parse(data []byte, source string) (Config, error) {
 	cfg := Config{
 		SIP:           raw.SIP,
 		TLS:           raw.TLS,
+		WS:            raw.WS,
+		WSS:           raw.WSS,
 		RTP:           raw.RTP,
+		Media:         raw.Media,
 		TLSProfiles:   raw.TLSProfiles,
 		LogLevel:      raw.LogLevel,
 		Observability: raw.Observability,
@@ -258,6 +289,13 @@ func validate(c Config, sequencePresent, nextHopPresent bool) error {
 			return fmt.Errorf("invalid observability.listen %q: %w", c.Observability.Listen, err)
 		}
 	}
+	// media.public_address, when set, is a bare host/IP advertised as the ICE-lite
+	// host candidate — it must not carry a port (the secured leg owns its own port).
+	if c.Media.PublicAddress != "" {
+		if _, _, err := net.SplitHostPort(c.Media.PublicAddress); err == nil {
+			return fmt.Errorf("media.public_address %q: want a bare host or IP", c.Media.PublicAddress)
+		}
+	}
 	for i, app := range c.Sequence {
 		if app.Name == "" {
 			return fmt.Errorf("sequence[%d]: missing required key %q", i, "name")
@@ -314,6 +352,25 @@ func validateTLSWiring(c Config) error {
 		}
 		if _, _, err := net.SplitHostPort(c.TLS.Listen); err != nil {
 			return fmt.Errorf("invalid tls.listen %q: %w", c.TLS.Listen, err)
+		}
+	}
+
+	// WebSocket listeners mirror the tls.listen wiring rules. WS is plain (no
+	// profile); WSS requires an existing tls_profile, exactly like tls.listen.
+	if c.WS.Listen != "" {
+		if _, _, err := net.SplitHostPort(c.WS.Listen); err != nil {
+			return fmt.Errorf("invalid ws.listen %q: %w", c.WS.Listen, err)
+		}
+	}
+	if c.WSS.Listen != "" {
+		if c.WSS.TLSProfile == "" {
+			return errors.New("wss.listen requires a tls_profile")
+		}
+		if _, _, err := net.SplitHostPort(c.WSS.Listen); err != nil {
+			return fmt.Errorf("invalid wss.listen %q: %w", c.WSS.Listen, err)
+		}
+		if _, ok := c.TLSProfiles[c.WSS.TLSProfile]; !ok {
+			return fmt.Errorf("wss.listen: unknown tls_profile %q", c.WSS.TLSProfile)
 		}
 	}
 
@@ -420,6 +477,13 @@ func resolveTLS(cfg *Config) error {
 			return err
 		}
 		cfg.TLS.Resolved = r
+	}
+	if cfg.WSS.Listen != "" {
+		r, err := resolve(cfg.WSS.TLSProfile)
+		if err != nil {
+			return err
+		}
+		cfg.WSS.Resolved = r
 	}
 	for i := range cfg.Sequence {
 		if cfg.Sequence[i].Transport == TransportTLS {

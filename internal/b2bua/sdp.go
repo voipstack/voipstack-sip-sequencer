@@ -42,6 +42,67 @@ func extractAudioCodecs(callOffer []byte) (formats string, rtpmaps, fmtps []stri
 	return formats, rtpmaps, fmtps, nil
 }
 
+// offerIsWebRTC reports whether an SDP offer is a WebRTC (DTLS-SRTP) offer rather
+// than a plain RTP/AVP offer. A browser offer uses a secure profile (RTP/SAVPF or
+// RTP/SAVP) on its m=audio line and carries a DTLS a=fingerprint; either signal is
+// sufficient. Plain RTP/AVP offers (no fingerprint) return false, so the plain
+// anchoring path is untouched. Pure; CRLF-tolerant.
+func offerIsWebRTC(sdp []byte) bool {
+	for _, rawLine := range bytes.Split(sdp, []byte("\n")) {
+		line := strings.TrimRight(string(rawLine), "\r")
+		if strings.HasPrefix(line, "m=audio ") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 {
+				proto := fields[2]
+				if strings.Contains(proto, "SAVPF") || strings.Contains(proto, "SAVP") {
+					return true
+				}
+			}
+		}
+		if strings.HasPrefix(line, "a=fingerprint:") {
+			return true
+		}
+	}
+	return false
+}
+
+// trickleICEContentType is the MIME type carrying a trickled ICE candidate fragment
+// in an in-dialog INFO (RFC 8840).
+const trickleICEContentType = "application/trickle-ice-sdpfrag"
+
+// isTrickleContentType reports whether a Content-Type value names the trickle-ICE
+// SDP-fragment type. Case-insensitive; any ;-params and surrounding spaces are ignored.
+func isTrickleContentType(ct string) bool {
+	value := ct
+	if i := strings.IndexByte(value, ';'); i >= 0 {
+		value = value[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(value), trickleICEContentType)
+}
+
+// TrickleFragment is the parsed content of a trickle-ICE INFO body: the candidate
+// attribute values it carries and whether it signals end-of-candidates.
+type TrickleFragment struct {
+	Candidates      []string
+	EndOfCandidates bool
+}
+
+// parseTrickleFragment extracts every a=candidate: value (with the a= prefix stripped,
+// i.e. "candidate:<foundation> …") and detects a=end-of-candidates. Pure, no I/O,
+// CRLF-tolerant; an empty or garbage body yields the zero-value fragment.
+func parseTrickleFragment(body []byte) TrickleFragment {
+	var frag TrickleFragment
+	for _, rawLine := range bytes.Split(body, []byte("\n")) {
+		line := strings.TrimRight(string(rawLine), "\r")
+		if strings.HasPrefix(line, "a=candidate:") {
+			frag.Candidates = append(frag.Candidates, strings.TrimPrefix(line, "a="))
+		} else if line == "a=end-of-candidates" {
+			frag.EndOfCandidates = true
+		}
+	}
+	return frag
+}
+
 // buildTapOffer builds a minimal SDP offer with two recvonly m=audio blocks.
 // Stream 1 (rtpPort1) = caller direction; stream 2 (rtpPort2) = callee direction.
 // Codec list is copied verbatim from callOffer.
@@ -94,6 +155,36 @@ func buildInactiveOffer(callOffer []byte, host string) ([]byte, error) {
 		b.WriteString(f + "\r\n")
 	}
 	b.WriteString("a=inactive\r\n")
+
+	return []byte(b.String()), nil
+}
+
+// buildPlainOfferFromWebRTC derives a plain RTP/AVP offer from a WebRTC (DTLS-SRTP)
+// offer: it carries the same negotiated audio codecs but strips every WebRTC-specific
+// attribute (the SAVPF profile, ICE, DTLS fingerprint, rtcp-mux). The opposite leg is
+// plain RTP and the codecs pass through end to end unchanged — the anchor never
+// transcodes. The codec list (and so the payload types) is copied verbatim so raw
+// payload forwarding stays correct. Pure; CRLF output; mirrors buildTapOffer.
+func buildPlainOfferFromWebRTC(webrtcOffer []byte, host string, rtpPort int) ([]byte, error) {
+	formats, rtpmaps, fmtps, err := extractAudioCodecs(webrtcOffer)
+	if err != nil {
+		return nil, fmt.Errorf("buildPlainOfferFromWebRTC: %w", err)
+	}
+
+	var b strings.Builder
+	b.WriteString("v=0\r\n")
+	b.WriteString("o=- 0 0 IN IP4 " + host + "\r\n")
+	b.WriteString("s=-\r\n")
+	b.WriteString("t=0 0\r\n")
+	b.WriteString("m=audio " + strconv.Itoa(rtpPort) + " RTP/AVP " + formats + "\r\n")
+	b.WriteString("c=IN IP4 " + host + "\r\n")
+	for _, r := range rtpmaps {
+		b.WriteString(r + "\r\n")
+	}
+	for _, f := range fmtps {
+		b.WriteString(f + "\r\n")
+	}
+	b.WriteString("a=sendrecv\r\n")
 
 	return []byte(b.String()), nil
 }

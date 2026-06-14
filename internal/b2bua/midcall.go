@@ -18,6 +18,13 @@ func (e *Engine) handleReInvite(call *Call, inbound *sipgo.DialogServerSession, 
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 481, "Call/Transaction Does Not Exist", nil))
 		return
 	}
+	// A webphone (secured) call has no plain endpointSide to re-anchor; re-INVITE on the
+	// DTLS-SRTP leg is not supported yet. Reject without disrupting the established media.
+	if call.media == nil || call.media.endpointSide == nil {
+		call.mu.Unlock()
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 488, "Not Acceptable Here", nil))
+		return
+	}
 	// Snapshot everything needed; unlock before any blocking I/O.
 	pbxSess := call.pbxLeg.session
 	media := call.media
