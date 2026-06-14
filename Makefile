@@ -16,7 +16,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 
 ARTIFACT := $(DIST)/$(BIN)-$(VERSION)-$(GOOS)-$(GOARCH)
 
-.PHONY: build release checksum deb test clean
+.PHONY: build release checksum deb test test-e2e clean
 
 build: | $(DIST)
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(DIST)/$(BIN) $(PKG)
