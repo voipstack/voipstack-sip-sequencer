@@ -256,6 +256,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	// REGISTER is intercepted at the registration edge: record the flow, insert a
 	// Path, forward to the registrar. It must not fall through to OnNoRoute.
 	e.srv.OnRegister(e.handleRegister)
+	// INFO is intercepted to consume trickle-ICE candidates on a secured webphone
+	// dialog (RFC 8840); every other INFO is proxied to cfg.NextHop unchanged.
+	e.srv.OnInfo(e.handleInfo)
 	// All methods not explicitly managed above are forwarded to cfg.NextHop.
 	e.srv.OnNoRoute(e.proxyUnmanaged)
 

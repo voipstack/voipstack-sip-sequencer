@@ -24,6 +24,11 @@ type WebRTCEndpoint interface {
 	ReadRTP(buf []byte) (int, error)
 	// LocalPort is the UDP port the endpoint listens on (RTP and RTCP share it).
 	LocalPort() int
+	// AddRemoteCandidate feeds one trickled ICE candidate (the candidate:… attribute
+	// value, no a= prefix) into the endpoint's connectivity checks.
+	AddRemoteCandidate(candidate string) error
+	// EndOfRemoteCandidates signals that the remote candidate list is complete.
+	EndOfRemoteCandidates() error
 	// Close releases the endpoint's sockets and goroutines; idempotent.
 	Close() error
 }
@@ -64,6 +69,12 @@ func (l *SecuredLeg) ReadRTP(buf []byte) (int, error) { return l.endpoint.ReadRT
 
 // AnswerSDP returns the ICE-lite/DTLS-SRTP SDP answer to send back to the webphone.
 func (l *SecuredLeg) AnswerSDP() []byte { return l.answerSDP }
+
+// AddRemoteCandidate delegates a trickled ICE candidate to the underlying endpoint.
+func (l *SecuredLeg) AddRemoteCandidate(c string) error { return l.endpoint.AddRemoteCandidate(c) }
+
+// EndOfRemoteCandidates delegates end-of-candidates to the underlying endpoint.
+func (l *SecuredLeg) EndOfRemoteCandidates() error { return l.endpoint.EndOfRemoteCandidates() }
 
 // Close tears down the endpoint (idempotent).
 func (l *SecuredLeg) Close() { _ = l.endpoint.Close() }
@@ -185,6 +196,26 @@ func (e *pionEndpoint) ReadRTP(buf []byte) (int, error) {
 
 // LocalPort returns the shared RTP/RTCP UDP port.
 func (e *pionEndpoint) LocalPort() int { return e.port }
+
+// AddRemoteCandidate adds one trickled remote ICE candidate to the agent. pion accepts
+// remote candidates after SetRemoteDescription; the candidate string is the
+// candidate:… attribute value with no a= prefix.
+func (e *pionEndpoint) AddRemoteCandidate(candidate string) error {
+	idx := uint16(0)
+	if err := e.pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidate, SDPMLineIndex: &idx}); err != nil {
+		return fmt.Errorf("add ice candidate: %w", err)
+	}
+	return nil
+}
+
+// EndOfRemoteCandidates marks the remote candidate list complete. pion's convention is
+// an empty-candidate AddICECandidate.
+func (e *pionEndpoint) EndOfRemoteCandidates() error {
+	if err := e.pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: ""}); err != nil {
+		return fmt.Errorf("end of remote candidates: %w", err)
+	}
+	return nil
+}
 
 // Close tears down the PeerConnection and the UDP mux, unblocking any pending ReadRTP.
 // Idempotent.

@@ -66,6 +66,43 @@ func offerIsWebRTC(sdp []byte) bool {
 	return false
 }
 
+// trickleICEContentType is the MIME type carrying a trickled ICE candidate fragment
+// in an in-dialog INFO (RFC 8840).
+const trickleICEContentType = "application/trickle-ice-sdpfrag"
+
+// isTrickleContentType reports whether a Content-Type value names the trickle-ICE
+// SDP-fragment type. Case-insensitive; any ;-params and surrounding spaces are ignored.
+func isTrickleContentType(ct string) bool {
+	value := ct
+	if i := strings.IndexByte(value, ';'); i >= 0 {
+		value = value[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(value), trickleICEContentType)
+}
+
+// TrickleFragment is the parsed content of a trickle-ICE INFO body: the candidate
+// attribute values it carries and whether it signals end-of-candidates.
+type TrickleFragment struct {
+	Candidates      []string
+	EndOfCandidates bool
+}
+
+// parseTrickleFragment extracts every a=candidate: value (with the a= prefix stripped,
+// i.e. "candidate:<foundation> …") and detects a=end-of-candidates. Pure, no I/O,
+// CRLF-tolerant; an empty or garbage body yields the zero-value fragment.
+func parseTrickleFragment(body []byte) TrickleFragment {
+	var frag TrickleFragment
+	for _, rawLine := range bytes.Split(body, []byte("\n")) {
+		line := strings.TrimRight(string(rawLine), "\r")
+		if strings.HasPrefix(line, "a=candidate:") {
+			frag.Candidates = append(frag.Candidates, strings.TrimPrefix(line, "a="))
+		} else if line == "a=end-of-candidates" {
+			frag.EndOfCandidates = true
+		}
+	}
+	return frag
+}
+
 // buildTapOffer builds a minimal SDP offer with two recvonly m=audio blocks.
 // Stream 1 (rtpPort1) = caller direction; stream 2 (rtpPort2) = callee direction.
 // Codec list is copied verbatim from callOffer.

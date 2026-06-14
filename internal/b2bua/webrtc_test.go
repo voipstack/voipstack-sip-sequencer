@@ -72,14 +72,35 @@ func TestPerLegSecurityIsIndependent(t *testing.T) {
 // ── fake WebRTC boundary (deterministic engine-wiring tests) ─────────────────
 
 type fakeWebRTCEndpoint struct {
-	answer []byte
-	mu     sync.Mutex
-	closed bool
+	answer     []byte
+	mu         sync.Mutex
+	closed     bool
+	candidates []string
+	gotEOC     bool
 }
 
 func (f *fakeWebRTCEndpoint) Answer(offer []byte) ([]byte, error) { return f.answer, nil }
 func (f *fakeWebRTCEndpoint) ReadRTP(buf []byte) (int, error)     { return 0, errors.New("no media") }
 func (f *fakeWebRTCEndpoint) LocalPort() int                      { return 0 }
+func (f *fakeWebRTCEndpoint) AddRemoteCandidate(candidate string) error {
+	f.mu.Lock()
+	f.candidates = append(f.candidates, candidate)
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeWebRTCEndpoint) EndOfRemoteCandidates() error {
+	f.mu.Lock()
+	f.gotEOC = true
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeWebRTCEndpoint) remoteCandidates() ([]string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.candidates))
+	copy(out, f.candidates)
+	return out, f.gotEOC
+}
 func (f *fakeWebRTCEndpoint) Close() error {
 	f.mu.Lock()
 	f.closed = true
