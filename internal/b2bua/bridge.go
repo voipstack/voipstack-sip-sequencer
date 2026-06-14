@@ -122,11 +122,10 @@ func (e *Engine) bridge(ctx context.Context, call *Call) {
 		return
 	}
 
-	// A webphone (WebRTC) endpoint is brought up and answered directly: the secured
-	// leg is the deliverable (STORY-001-019). Dialing the PBX and bridging the secured
-	// leg to it is STORY-001-021, so no PBX dial and no relay run here.
+	// A webphone (WebRTC) endpoint: dial the plain PBX, answer the webphone with its
+	// DTLS-SRTP SDP, and bridge the secured leg to the plain PBX leg (STORY-001-021).
 	if anchor.securedLeg != nil {
-		if !e.answerSecuredEndpoint(call, anchor, start) {
+		if !e.bridgeSecuredToPBX(ctx, call, anchor, start) {
 			return
 		}
 		<-ctx.Done()
@@ -505,16 +504,9 @@ func (e *Engine) anchorWebRTC(call *Call) (mediaAnchor, bool) {
 // SDP, marks the call established, and registers the stashed taps. It returns false
 // when answering fails (call torn down).
 func (e *Engine) answerSecuredEndpoint(call *Call, anchor mediaAnchor, start time.Time) bool {
-	answerSDP := anchor.securedLeg.AnswerSDP()
-	if err := call.inbound.session.Respond(200, "OK", answerSDP); err != nil {
-		slog.Error("answer webphone endpoint", "err", err)
-		releasePendingTaps(call, e.ports)
-		call.teardown("answer webphone endpoint failed")
-		return false
-	}
-
-	e.metrics.ObserveSequencingLatency(time.Since(start))
-
+	// Mark established and register taps before sending 200 OK, so an immediate in-dialog
+	// re-INVITE/REFER from the webphone is handled (not 481'd) the instant it learns the
+	// call is up.
 	call.mu.Lock()
 	if canTransition(call.state, stateEstablished) {
 		call.state = stateEstablished
@@ -525,26 +517,112 @@ func (e *Engine) answerSecuredEndpoint(call *Call, anchor mediaAnchor, start tim
 	call.pendingTaps = nil
 	call.mu.Unlock()
 
-	return true
-}
-
-// dialPBX originates the terminating PBX leg, anchors the PBX-side media from its
-// answer, answers the inbound caller with the anchored SDP, marks the call
-// established, and registers the stashed taps. It returns false when a failure
-// aborts the call (final response already sent, call torn down).
-func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, start time.Time) bool {
-	pbxOffer, err := rewriteToAnchor(call.inbound.offerSDP, e.mediaHost, anchor.pbxPair.RTP)
-	if err != nil {
-		slog.Error("rewrite SDP for PBX", "err", err)
-		e.fail(call, 500, "Server Error", "rewrite sdp: "+err.Error())
+	answerSDP := anchor.securedLeg.AnswerSDP()
+	if err := call.inbound.session.Respond(200, "OK", answerSDP); err != nil {
+		slog.Error("answer webphone endpoint", "err", err)
+		releasePendingTaps(call, e.ports)
+		call.teardown("answer webphone endpoint failed")
 		return false
 	}
 
+	e.metrics.ObserveSequencingLatency(time.Since(start))
+
+	return true
+}
+
+// bridgeSecuredToPBX completes the secured (webphone) path: it binds the plain
+// PBX-facing anchor side (pion owns the webphone side's port), dials the PBX with a
+// plain RTP/AVP offer carrying the negotiated codecs (no transcoding), anchors the PBX
+// side to the PBX answer, answers the webphone with its DTLS-SRTP SDP, and starts the
+// security-agnostic media bridge between the secured endpoint leg and the plain PBX leg.
+// It returns false when a failure aborts the call (final response already sent, call
+// torn down).
+func (e *Engine) bridgeSecuredToPBX(ctx context.Context, call *Call, anchor mediaAnchor, start time.Time) bool {
+	pbxPair, err := e.ports.Acquire()
+	if err != nil {
+		e.fail(call, 503, "Service Unavailable", "rtp ports exhausted")
+		return false
+	}
+	pbxSide, err := newAnchorSide(e.mediaHost, pbxPair)
+	if err != nil {
+		e.ports.Release(pbxPair)
+		slog.Error("bind pbx media sockets", "err", err)
+		e.fail(call, 500, "Server Error", "media bind failed")
+		return false
+	}
+
+	// Register the PBX side on the existing media session (the secured endpoint leg is
+	// already set) and extend the release hook to free the PBX pair on teardown.
+	sess := anchor.session
+	ports := e.ports
+	call.mu.Lock()
+	sess.pbxSide = pbxSide
+	call.releaseMedia = func() {
+		sess.Close()
+		ports.Release(pbxPair)
+		for _, t := range sess.tapList() {
+			ports.Release(t.callerPair)
+			ports.Release(t.calleePair)
+		}
+	}
+	call.mu.Unlock()
+
+	// Plain RTP/AVP offer toward the PBX: same codecs, no ICE/DTLS/rtcp-mux.
+	pbxOffer, err := buildPlainOfferFromWebRTC(call.inbound.offerSDP, e.mediaHost, pbxPair.RTP)
+	if err != nil {
+		slog.Error("build pbx offer", "err", err)
+		e.fail(call, 500, "Server Error", "build pbx offer: "+err.Error())
+		return false
+	}
+
+	_, pbxAnswerRaw, ok := e.originatePBX(ctx, call, pbxOffer)
+	if !ok {
+		return false
+	}
+
+	pbxHost, pbxRTPPort, err := parseMedia(pbxAnswerRaw)
+	if err != nil {
+		e.metrics.TerminatingHopFailure()
+		slog.Error("parse pbx answer SDP", "err", err)
+		e.fail(call, 488, "Not Acceptable Here", "bad pbx answer SDP")
+		return false
+	}
+	pbxSide.setRemote(
+		&net.UDPAddr{IP: net.ParseIP(pbxHost), Port: pbxRTPPort},
+		&net.UDPAddr{IP: net.ParseIP(pbxHost), Port: pbxRTPPort + 1},
+	)
+
+	// Answer the webphone with the secured leg's ICE-lite/DTLS-SRTP SDP (registers taps,
+	// transitions the call to established).
+	if !e.answerSecuredEndpoint(call, anchor, start) {
+		return false
+	}
+
+	// Bridge the secured endpoint leg to the plain PBX leg, fanning RTP out to taps.
+	taps := sess.tapList()
+	callerTaps := make([]*AnchorSide, 0, len(taps))
+	calleeTaps := make([]*AnchorSide, 0, len(taps))
+	for _, t := range taps {
+		callerTaps = append(callerTaps, t.callerStream)
+		calleeTaps = append(calleeTaps, t.calleeStream)
+	}
+	go sess.bridgeLegs(ctx, anchor.securedLeg, pbxSide, callerTaps, calleeTaps)
+
+	return true
+}
+
+// originatePBX dials the terminating PBX leg with the given offer, relaying provisional
+// responses to the inbound caller, waits for the answer, ACKs it, records the PBX leg
+// and its teardown hook, and returns the PBX 2xx response and its raw answer SDP. It is
+// the offer-agnostic core shared by the plain path (dialPBX) and the secured-bridge path
+// (bridgeSecuredToPBX). It returns ok=false when a failure aborts the call (final
+// response already sent, call torn down).
+func (e *Engine) originatePBX(ctx context.Context, call *Call, pbxOffer []byte) (*sip.Response, []byte, bool) {
 	var pbxURI sip.Uri
 	if err := sip.ParseUri(e.cfg.NextHop.URI, &pbxURI); err != nil {
 		slog.Error("parse pbx URI", "uri", e.cfg.NextHop.URI, "err", err)
 		e.fail(call, 500, "Server Error", "bad pbx URI")
-		return false
+		return nil, nil, false
 	}
 
 	// Next-hop transport switch: tls dials over its profile's per-profile dialer with a
@@ -571,7 +649,7 @@ func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, st
 		e.metrics.TerminatingHopFailure()
 		slog.Error("originate pbx leg", "uri", e.cfg.NextHop.URI, "err", err)
 		e.fail(call, 503, "Service Unavailable", "pbx leg originate failed")
-		return false
+		return nil, nil, false
 	}
 	call.mu.Lock()
 	call.pbxLeg = &OutboundLeg{
@@ -606,7 +684,7 @@ func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, st
 		}
 		releasePendingTaps(call, e.ports)
 		call.teardown(fmt.Sprintf("pbx leg failed: %v", pbxErr))
-		return false
+		return nil, nil, false
 	}
 
 	pbxResp := pbxSess.InviteResponse
@@ -624,6 +702,26 @@ func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, st
 			call.teardown("pbx dialog ended")
 		}
 	})
+
+	return pbxResp, pbxAnswerRaw, true
+}
+
+// dialPBX originates the terminating PBX leg, anchors the PBX-side media from its
+// answer, answers the inbound caller with the anchored SDP, marks the call
+// established, and registers the stashed taps. It returns false when a failure
+// aborts the call (final response already sent, call torn down).
+func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, start time.Time) bool {
+	pbxOffer, err := rewriteToAnchor(call.inbound.offerSDP, e.mediaHost, anchor.pbxPair.RTP)
+	if err != nil {
+		slog.Error("rewrite SDP for PBX", "err", err)
+		e.fail(call, 500, "Server Error", "rewrite sdp: "+err.Error())
+		return false
+	}
+
+	pbxResp, pbxAnswerRaw, ok := e.originatePBX(ctx, call, pbxOffer)
+	if !ok {
+		return false
+	}
 
 	// Wire PBX-side remote address from PBX answer.
 	pbxHost, pbxRTPPort, err := parseMedia(pbxAnswerRaw)

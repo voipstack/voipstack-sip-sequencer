@@ -7,6 +7,8 @@ import (
 
 	"github.com/pion/ice/v4"
 	"github.com/pion/logging"
+	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -20,8 +22,15 @@ type WebRTCEndpoint interface {
 	// drives the DTLS-SRTP handshake setup, and returns the SDP answer to send back.
 	Answer(offer []byte) (answer []byte, err error)
 	// ReadRTP yields one decrypted RTP packet from the endpoint (the seam the media
-	// relay — STORY-001-021 — will consume).
+	// relay consumes).
 	ReadRTP(buf []byte) (int, error)
+	// WriteRTP sends one plaintext RTP packet toward the webphone, encrypting it to
+	// SRTP. A write before the leg is up is dropped, not an error.
+	WriteRTP(pkt []byte) (int, error)
+	// ReadRTCP yields one decrypted RTCP packet from the endpoint (rtcp-mux'd port).
+	ReadRTCP(buf []byte) (int, error)
+	// WriteRTCP sends one plaintext RTCP packet toward the webphone over the muxed port.
+	WriteRTCP(pkt []byte) (int, error)
 	// LocalPort is the UDP port the endpoint listens on (RTP and RTCP share it).
 	LocalPort() int
 	// AddRemoteCandidate feeds one trickled ICE candidate (the candidate:… attribute
@@ -66,6 +75,15 @@ func (l *SecuredLeg) Security() MediaSecurity { return SecurityDTLSSRTP }
 
 // ReadRTP yields one decrypted RTP packet from the endpoint.
 func (l *SecuredLeg) ReadRTP(buf []byte) (int, error) { return l.endpoint.ReadRTP(buf) }
+
+// WriteRTP encrypts and sends one plaintext RTP packet toward the webphone.
+func (l *SecuredLeg) WriteRTP(pkt []byte) (int, error) { return l.endpoint.WriteRTP(pkt) }
+
+// ReadRTCP yields one decrypted RTCP packet from the endpoint.
+func (l *SecuredLeg) ReadRTCP(buf []byte) (int, error) { return l.endpoint.ReadRTCP(buf) }
+
+// WriteRTCP encrypts and sends one plaintext RTCP packet toward the webphone.
+func (l *SecuredLeg) WriteRTCP(pkt []byte) (int, error) { return l.endpoint.WriteRTCP(pkt) }
 
 // AnswerSDP returns the ICE-lite/DTLS-SRTP SDP answer to send back to the webphone.
 func (l *SecuredLeg) AnswerSDP() []byte { return l.answerSDP }
@@ -132,20 +150,25 @@ type pionEndpoint struct {
 	udpConn *net.UDPConn
 	port    int
 
-	ready     chan struct{} // closed when the remote track arrives or on Close
-	readyOnce sync.Once     // guards close(ready)
-	mu        sync.Mutex    // guards track
-	track     *webrtc.TrackRemote
-	closeOnce sync.Once
+	ready      chan struct{} // closed when the remote track arrives or on Close
+	readyOnce  sync.Once     // guards close(ready)
+	mu         sync.Mutex    // guards track, receiver, localTrack
+	track      *webrtc.TrackRemote
+	receiver   *webrtc.RTPReceiver         // inbound RTCP source (rtcp-mux'd port)
+	localTrack *webrtc.TrackLocalStaticRTP // outbound: pion encrypts writes to SRTP
+	closeOnce  sync.Once
 }
 
 // Answer drives ICE-lite gathering and the DTLS-SRTP setup, returning the SDP answer.
 // rtcp-mux and the DTLS fingerprint are produced by pion in the answer. The OnTrack
-// handler captures the inbound plaintext RTP track for ReadRTP.
+// handler captures the inbound plaintext RTP track (for ReadRTP) and its receiver (for
+// ReadRTCP). A local sendable track is added so the answer is sendrecv and pion
+// encrypts outbound RTP to SRTP for WriteRTP.
 func (e *pionEndpoint) Answer(offer []byte) ([]byte, error) {
-	e.pc.OnTrack(func(tr *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+	e.pc.OnTrack(func(tr *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
 		e.mu.Lock()
 		e.track = tr
+		e.receiver = recv
 		e.mu.Unlock()
 		e.readyOnce.Do(func() { close(e.ready) })
 	})
@@ -156,6 +179,23 @@ func (e *pionEndpoint) Answer(offer []byte) ([]byte, error) {
 	}); err != nil {
 		return nil, fmt.Errorf("set remote description: %w", err)
 	}
+
+	// Add a local outbound track so the answer advertises sendrecv and pion encrypts
+	// plaintext RTP written via WriteRTP into SRTP toward the webphone. Opus is the
+	// browser webphone's codec; the bridge's byte-for-byte forwarding is codec-agnostic
+	// and proven independently of this concrete track.
+	localTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "anchor")
+	if err != nil {
+		return nil, fmt.Errorf("create local track: %w", err)
+	}
+	if _, err := e.pc.AddTrack(localTrack); err != nil {
+		return nil, fmt.Errorf("add local track: %w", err)
+	}
+	e.mu.Lock()
+	e.localTrack = localTrack
+	e.mu.Unlock()
+
 	answer, err := e.pc.CreateAnswer(nil)
 	if err != nil {
 		return nil, fmt.Errorf("create answer: %w", err)
@@ -192,6 +232,56 @@ func (e *pionEndpoint) ReadRTP(buf []byte) (int, error) {
 		return 0, fmt.Errorf("marshal rtp: %w", err)
 	}
 	return copy(buf, raw), nil
+}
+
+// WriteRTP encrypts and sends one plaintext RTP packet toward the webphone via the
+// local track. pion rewrites the SSRC/payload type to the negotiated values and
+// encrypts to SRTP. A write before the local track exists (leg not yet answered) is
+// dropped, not an error; pion itself drops writes before a peer binds.
+func (e *pionEndpoint) WriteRTP(pkt []byte) (int, error) {
+	e.mu.Lock()
+	tr := e.localTrack
+	e.mu.Unlock()
+	if tr == nil {
+		return len(pkt), nil
+	}
+	var p rtp.Packet
+	if err := p.Unmarshal(pkt); err != nil {
+		return 0, fmt.Errorf("unmarshal rtp: %w", err)
+	}
+	if err := tr.WriteRTP(&p); err != nil {
+		return 0, err
+	}
+	return len(pkt), nil
+}
+
+// ReadRTCP blocks until the inbound track (and its receiver) is available, then reads
+// one decrypted RTCP packet from the rtcp-mux'd port. A Close before the receiver
+// arrives unblocks and returns an error rather than hanging.
+func (e *pionEndpoint) ReadRTCP(buf []byte) (int, error) {
+	<-e.ready
+	e.mu.Lock()
+	recv := e.receiver
+	e.mu.Unlock()
+	if recv == nil {
+		return 0, fmt.Errorf("webrtc endpoint closed before receiver ready")
+	}
+	n, _, err := recv.Read(buf)
+	return n, err
+}
+
+// WriteRTCP sends one plaintext RTCP packet toward the webphone over the muxed port.
+// The bytes are parsed into RTCP packets and handed to the PeerConnection, which
+// encrypts them. Best-effort: an unparseable RTCP packet is dropped.
+func (e *pionEndpoint) WriteRTCP(pkt []byte) (int, error) {
+	pkts, err := rtcp.Unmarshal(pkt)
+	if err != nil {
+		return 0, fmt.Errorf("unmarshal rtcp: %w", err)
+	}
+	if err := e.pc.WriteRTCP(pkts); err != nil {
+		return 0, err
+	}
+	return len(pkt), nil
 }
 
 // LocalPort returns the shared RTP/RTCP UDP port.

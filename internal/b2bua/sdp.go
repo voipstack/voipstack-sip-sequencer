@@ -159,6 +159,36 @@ func buildInactiveOffer(callOffer []byte, host string) ([]byte, error) {
 	return []byte(b.String()), nil
 }
 
+// buildPlainOfferFromWebRTC derives a plain RTP/AVP offer from a WebRTC (DTLS-SRTP)
+// offer: it carries the same negotiated audio codecs but strips every WebRTC-specific
+// attribute (the SAVPF profile, ICE, DTLS fingerprint, rtcp-mux). The opposite leg is
+// plain RTP and the codecs pass through end to end unchanged — the anchor never
+// transcodes. The codec list (and so the payload types) is copied verbatim so raw
+// payload forwarding stays correct. Pure; CRLF output; mirrors buildTapOffer.
+func buildPlainOfferFromWebRTC(webrtcOffer []byte, host string, rtpPort int) ([]byte, error) {
+	formats, rtpmaps, fmtps, err := extractAudioCodecs(webrtcOffer)
+	if err != nil {
+		return nil, fmt.Errorf("buildPlainOfferFromWebRTC: %w", err)
+	}
+
+	var b strings.Builder
+	b.WriteString("v=0\r\n")
+	b.WriteString("o=- 0 0 IN IP4 " + host + "\r\n")
+	b.WriteString("s=-\r\n")
+	b.WriteString("t=0 0\r\n")
+	b.WriteString("m=audio " + strconv.Itoa(rtpPort) + " RTP/AVP " + formats + "\r\n")
+	b.WriteString("c=IN IP4 " + host + "\r\n")
+	for _, r := range rtpmaps {
+		b.WriteString(r + "\r\n")
+	}
+	for _, f := range fmtps {
+		b.WriteString(f + "\r\n")
+	}
+	b.WriteString("a=sendrecv\r\n")
+
+	return []byte(b.String()), nil
+}
+
 // parseTapAnswer extracts the remote host and port for each of the two m=audio streams
 // from an app's answer SDP. A missing stream or port 0 returns ("", 0) for that stream.
 func parseTapAnswer(answer []byte) (h1 string, p1 int, h2 string, p2 int, err error) {

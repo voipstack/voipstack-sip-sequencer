@@ -27,10 +27,20 @@ func (s MediaSecurity) String() string {
 
 // MediaLeg is one anchored media endpoint, abstracted over its security profile. Both
 // the plain AnchorSide and the secured WebRTC leg satisfy it, so the media relay can
-// treat them uniformly via plaintext RTP. ReadRTP yields decrypted RTP regardless of
-// the leg's on-the-wire security.
+// treat them uniformly via plaintext RTP/RTCP. Read* yields decrypted plaintext and
+// Write* accepts plaintext, each applying the leg's own on-the-wire security. Because
+// encrypt/decrypt is a property of the leg and not of the relay, an SRTP↔SRTP proxy is
+// later enabled by changing a leg's security alone — the forwarding path is unchanged.
 type MediaLeg interface {
 	Security() MediaSecurity
+	// ReadRTP yields one decrypted/plaintext RTP packet from the leg.
 	ReadRTP(buf []byte) (int, error)
+	// WriteRTP sends one plaintext RTP packet on the leg, applying the leg's outbound
+	// security (plain = raw write; secured = encrypt to SRTP).
+	WriteRTP(pkt []byte) (int, error)
+	// ReadRTCP yields one decrypted/plaintext RTCP packet from the leg.
+	ReadRTCP(buf []byte) (int, error)
+	// WriteRTCP sends one plaintext RTCP packet on the leg, applying outbound security.
+	WriteRTCP(pkt []byte) (int, error)
 	Close()
 }

@@ -32,6 +32,13 @@ func (e *Engine) handleRefer(req *sip.Request, tx sip.ServerTransaction) {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 403, "Forbidden", nil))
 		return
 	}
+	// A webphone (secured) call has no plain endpointSide to re-point; REFER on the
+	// DTLS-SRTP leg is not supported yet. Reject without disrupting the established media.
+	if call.media == nil || call.media.endpointSide == nil {
+		call.mu.Unlock()
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 488, "Not Acceptable Here", nil))
+		return
+	}
 	media := call.media
 	epPort := call.media.endpointSide.localRTPPort
 	pbxAnswerSDP := copyBody(call.pbxLeg.answerSDP)

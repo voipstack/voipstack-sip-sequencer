@@ -143,6 +143,13 @@ func TestTrickleInfoFeedsSecuredLeg(t *testing.T) {
 
 	_ = startEngineOpts(t, cfg, WithWebRTCFactory(fac))
 
+	// The webphone is bridged to the PBX (STORY-001-021): the PBX must answer for the
+	// flow to complete. The webphone still receives the secured leg's SDP.
+	go func() {
+		dss := pbx.waitInvite(t, 3*time.Second)
+		_ = dss.Respond(200, "OK", []byte(testSDP))
+	}()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	sess, err := caller.invite(ctx, "sip:"+listenAddr, []byte(webrtcOfferSDP))
@@ -266,6 +273,13 @@ func TestRealWebphoneTrickleBringsLegUp(t *testing.T) {
 			once.Do(func() { close(connected) })
 		}
 	})
+
+	// The webphone is bridged to the PBX (STORY-001-021): the PBX must answer for the
+	// flow to complete. The webphone still receives the secured leg's real ICE-lite SDP.
+	go func() {
+		dss := pbx.waitInvite(t, 5*time.Second)
+		_ = dss.Respond(200, "OK", []byte(testSDP))
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

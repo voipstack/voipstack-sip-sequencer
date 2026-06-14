@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/emiago/sipgo"
+	"github.com/emiago/sipgo/sip"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/voipstack/voipstack-sip-sequencer/internal/config"
@@ -77,11 +78,91 @@ type fakeWebRTCEndpoint struct {
 	closed     bool
 	candidates []string
 	gotEOC     bool
+
+	// Bridge-test plumbing (nil on zero-value fakes, which behave as "no media"):
+	// inRTP/inRTCP yield canned decrypted packets from Read*; wrRTP/wrRTCP record the
+	// plaintext handed to Write* (the encrypt boundary); writeErr forces a write failure
+	// to exercise media-plane failure isolation; done unblocks pending reads on Close.
+	inRTP    chan []byte
+	inRTCP   chan []byte
+	wrRTP    [][]byte
+	wrRTCP   [][]byte
+	writeErr error
+	done     chan struct{}
+}
+
+// newBridgeFakeEndpoint builds a fake wired for bridgeLegs tests: it yields canned
+// decrypted RTP/RTCP and records what is written to it.
+func newBridgeFakeEndpoint() *fakeWebRTCEndpoint {
+	return &fakeWebRTCEndpoint{
+		inRTP:  make(chan []byte, 8),
+		inRTCP: make(chan []byte, 8),
+		done:   make(chan struct{}),
+	}
 }
 
 func (f *fakeWebRTCEndpoint) Answer(offer []byte) ([]byte, error) { return f.answer, nil }
-func (f *fakeWebRTCEndpoint) ReadRTP(buf []byte) (int, error)     { return 0, errors.New("no media") }
-func (f *fakeWebRTCEndpoint) LocalPort() int                      { return 0 }
+func (f *fakeWebRTCEndpoint) ReadRTP(buf []byte) (int, error) {
+	if f.inRTP == nil {
+		return 0, errors.New("no media")
+	}
+	select {
+	case pkt, ok := <-f.inRTP:
+		if !ok {
+			return 0, errors.New("webrtc endpoint closed")
+		}
+		return copy(buf, pkt), nil
+	case <-f.done:
+		return 0, errors.New("webrtc endpoint closed")
+	}
+}
+func (f *fakeWebRTCEndpoint) ReadRTCP(buf []byte) (int, error) {
+	if f.inRTCP == nil {
+		return 0, errors.New("no media")
+	}
+	select {
+	case pkt, ok := <-f.inRTCP:
+		if !ok {
+			return 0, errors.New("webrtc endpoint closed")
+		}
+		return copy(buf, pkt), nil
+	case <-f.done:
+		return 0, errors.New("webrtc endpoint closed")
+	}
+}
+func (f *fakeWebRTCEndpoint) WriteRTP(pkt []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	f.wrRTP = append(f.wrRTP, append([]byte(nil), pkt...))
+	return len(pkt), nil
+}
+func (f *fakeWebRTCEndpoint) WriteRTCP(pkt []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	f.wrRTCP = append(f.wrRTCP, append([]byte(nil), pkt...))
+	return len(pkt), nil
+}
+func (f *fakeWebRTCEndpoint) writtenRTP() [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][]byte, len(f.wrRTP))
+	copy(out, f.wrRTP)
+	return out
+}
+func (f *fakeWebRTCEndpoint) writtenRTCP() [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][]byte, len(f.wrRTCP))
+	copy(out, f.wrRTCP)
+	return out
+}
+func (f *fakeWebRTCEndpoint) LocalPort() int { return 0 }
 func (f *fakeWebRTCEndpoint) AddRemoteCandidate(candidate string) error {
 	f.mu.Lock()
 	f.candidates = append(f.candidates, candidate)
@@ -104,6 +185,13 @@ func (f *fakeWebRTCEndpoint) remoteCandidates() ([]string, bool) {
 func (f *fakeWebRTCEndpoint) Close() error {
 	f.mu.Lock()
 	f.closed = true
+	if f.done != nil {
+		select {
+		case <-f.done:
+		default:
+			close(f.done)
+		}
+	}
 	f.mu.Unlock()
 	return nil
 }
@@ -157,15 +245,17 @@ func startEngineOpts(t *testing.T, cfg config.Config, opts ...Option) *Engine {
 	return eng
 }
 
-// A WebRTC INVITE is answered from the secured leg's SDP, the configured public
-// address reaches the factory, and no PBX leg is dialed (bringing the leg up is the
-// whole of STORY-001-019; bridging to a PBX is STORY-001-021).
-func TestWebRTCOfferAnsweredFromSecuredLegNoPBX(t *testing.T) {
+// establishWebphoneToPBX brings up a webphone (WebRTC) INVITE bridged to a plain-RTP
+// PBX: the PBX answers plain RTP and the webphone is answered with the secured leg's
+// (fake) DTLS-SRTP SDP. It returns the engine, the caller's established dialog session,
+// and the offer the PBX received.
+func establishWebphoneToPBX(t *testing.T) (*Engine, *sipgo.DialogClientSession, []byte) {
+	t.Helper()
 	pbx := newFakeUAS(t)
 	caller := newFakeUAC(t)
 
 	listenAddr := freeAddr(t)
-	// No application sequence: this test targets the media leg, not the app chain.
+	// No application sequence: this targets the media leg, not the app chain.
 	cfg := config.Config{
 		SIP:     config.SIP{Listen: listenAddr},
 		NextHop: config.NextHop{URI: pbx.sipURI()},
@@ -180,7 +270,17 @@ func TestWebRTCOfferAnsweredFromSecuredLegNoPBX(t *testing.T) {
 	eng := startEngineOpts(t, cfg, WithWebRTCFactory(fac))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
+
+	var pbxOffer []byte
+	pbxDone := make(chan struct{})
+	go func() {
+		dss := pbx.waitInvite(t, 3*time.Second)
+		pbxOffer = copyBody(dss.InviteRequest.Body())
+		_ = dss.Respond(200, "OK", []byte(testSDP))
+		close(pbxDone)
+	}()
+
 	sess, err := caller.invite(ctx, "sip:"+listenAddr, []byte(webrtcOfferSDP))
 	if err != nil {
 		t.Fatalf("invite: %v", err)
@@ -188,13 +288,16 @@ func TestWebRTCOfferAnsweredFromSecuredLegNoPBX(t *testing.T) {
 	if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
 		t.Fatalf("wait answer: %v", err)
 	}
+	<-pbxDone
 	if got := string(sess.InviteResponse.Body()); got != string(fakeAnswer) {
-		t.Errorf("answer body = %q, want secured leg answer %q", got, string(fakeAnswer))
+		t.Fatalf("answer body = %q, want secured leg answer %q", got, string(fakeAnswer))
 	}
 	if err := sess.Ack(ctx); err != nil {
 		t.Fatalf("ack: %v", err)
 	}
 
+	// The configured public address still reaches the factory (the secured leg is brought
+	// up exactly as in STORY-001-019).
 	fac.mu.Lock()
 	gotAddr := fac.gotPublicAddr
 	fac.mu.Unlock()
@@ -202,11 +305,74 @@ func TestWebRTCOfferAnsweredFromSecuredLegNoPBX(t *testing.T) {
 		t.Errorf("factory public address = %q, want %q", gotAddr, "203.0.113.7")
 	}
 
-	// No PBX leg is dialed for a webphone leg in this story.
-	pbx.noInvite(t, 300*time.Millisecond)
+	return eng, sess, pbxOffer
+}
 
+// AC1/AC3/AC5: a webphone (WebRTC) INVITE is bridged to a plain-RTP PBX — the PBX is
+// dialed with a plain RTP/AVP offer carrying the negotiated codecs (downgraded from the
+// WebRTC offer, no transcoding), and the webphone is answered with the secured leg's SDP.
+func TestWebRTCBridgedToPBX(t *testing.T) {
+	eng, _, pbxOffer := establishWebphoneToPBX(t)
+
+	off := string(pbxOffer)
+	if !strings.Contains(off, "RTP/AVP") || strings.Contains(off, "SAVPF") {
+		t.Errorf("PBX offer not downgraded to plain RTP/AVP:\n%s", off)
+	}
+	for _, forbidden := range []string{"a=fingerprint", "a=rtcp-mux", "a=candidate", "ice-"} {
+		if strings.Contains(off, forbidden) {
+			t.Errorf("PBX offer must not carry WebRTC attribute %q:\n%s", forbidden, off)
+		}
+	}
+	if !strings.Contains(off, "opus/48000") {
+		t.Errorf("PBX offer lost the negotiated codec:\n%s", off)
+	}
 	if n := eng.calls.len(); n != 1 {
 		t.Fatalf("expected 1 active call, got %d", n)
+	}
+}
+
+// AC6 boundary: a re-INVITE on a webphone (secured) call is rejected 488 and the call
+// keeps running — the nil plain endpointSide must not panic.
+func TestReInviteOnWebphoneCallRejected(t *testing.T) {
+	eng, sess, _ := establishWebphoneToPBX(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	reInvite := sip.NewRequest(sip.INVITE, sess.InviteResponse.Contact().Address)
+	reInvite.SetBody([]byte(webrtcOfferSDP))
+	reInvite.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	res, err := sess.Do(ctx, reInvite)
+	if err != nil {
+		t.Fatalf("re-INVITE do: %v", err)
+	}
+	if res.StatusCode != 488 {
+		t.Fatalf("re-INVITE status = %d, want 488", res.StatusCode)
+	}
+	if n := eng.calls.len(); n != 1 {
+		t.Fatalf("call torn down by re-INVITE; want 1 active, got %d", n)
+	}
+}
+
+// AC6 boundary: a REFER on a webphone (secured) call is rejected 488 and the call keeps
+// running.
+func TestReferOnWebphoneCallRejected(t *testing.T) {
+	eng, sess, _ := establishWebphoneToPBX(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	refer := sip.NewRequest(sip.REFER, sess.InviteResponse.Contact().Address)
+	refer.AppendHeader(sip.NewHeader("Refer-To", "sip:transfer@example.com"))
+	res, err := sess.Do(ctx, refer)
+	if err != nil {
+		t.Fatalf("REFER do: %v", err)
+	}
+	if res.StatusCode != 488 {
+		t.Fatalf("REFER status = %d, want 488", res.StatusCode)
+	}
+	if n := eng.calls.len(); n != 1 {
+		t.Fatalf("call torn down by REFER; want 1 active, got %d", n)
 	}
 }
 
@@ -279,6 +445,14 @@ func TestWebRTCRealHandshakeBringsLegUp(t *testing.T) {
 			once.Do(func() { close(connected) })
 		}
 	})
+
+	// The webphone is bridged to the PBX (STORY-001-021): the PBX must answer for the flow
+	// to complete. The webphone still receives the secured leg's real ICE-lite SDP, not
+	// the PBX answer.
+	go func() {
+		dss := pbx.waitInvite(t, 5*time.Second)
+		_ = dss.Respond(200, "OK", []byte(testSDP))
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
