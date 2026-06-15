@@ -23,12 +23,6 @@ func withTransport(u sip.Uri, transport string) sip.Uri {
 	return u
 }
 
-// withTCP forces transport=tcp. Plain application legs always run over TCP because the
-// offer (grown in tap mode) can exceed sipgo's UDP MTU guard.
-func withTCP(u sip.Uri) sip.Uri {
-	return withTransport(u, "tcp")
-}
-
 // dialContext bounds the dial — where sipgo performs the TCP+TLS connect — by the
 // profile's connect_timeout when one is set, so a dead TLS peer fails fast instead of
 // hanging the call. A zero timeout (or nil profile) leaves the dial unbounded. The
@@ -38,6 +32,71 @@ func dialContext(parent context.Context, rp *config.ResolvedTLSProfile) (context
 		return context.WithTimeout(parent, rp.ConnectTimeout)
 	}
 	return parent, func() {}
+}
+
+// dialerFor selects the dialog client cache and the transport-forced URI for an
+// outbound leg, plus a dial context bounded by the profile's connect timeout. A tls leg
+// dials over its per-profile dialer with the bounded context; any other transport uses
+// the plain dialer and, when plainTransport is non-empty, forces it onto the URI
+// ("tcp" for app legs, which must run over TCP; "tcp"/"" for the next hop's tcp/udp
+// default). The caller must invoke the returned cancel once the dial returns.
+func (e *Engine) dialerFor(ctx context.Context, uri sip.Uri, transport config.Transport, tlsProfile string, resolved *config.ResolvedTLSProfile, plainTransport string) (*sipgo.DialogClientCache, sip.Uri, context.Context, context.CancelFunc) {
+	if transport == config.TransportTLS {
+		dialCtx, cancel := dialContext(ctx, resolved)
+		return e.tlsDialers[tlsProfile], withTransport(uri, "tls"), dialCtx, cancel
+	}
+	if plainTransport != "" {
+		uri = withTransport(uri, plainTransport)
+	}
+	return e.dialogCliCache, uri, ctx, func() {}
+}
+
+// relayProvisional builds AnswerOptions whose OnResponse forwards each non-100
+// provisional from an outbound leg to the inbound caller, preserving relayable headers.
+func (c *Call) relayProvisional() sipgo.AnswerOptions {
+	return sipgo.AnswerOptions{
+		OnResponse: func(res *sip.Response) error {
+			if res.IsProvisional() && res.StatusCode != 100 {
+				_ = c.inbound.session.Respond(res.StatusCode, res.Reason, res.Body(),
+					relayableResponseHeaders(res, res.Body())...)
+			}
+			return nil
+		},
+	}
+}
+
+// respondInboundFromLegError sends the inbound caller a final response derived from a
+// failed outbound leg — relaying the leg's own status/reason/body when it rejected with
+// a SIP response, or a timeout 503 otherwise — then releases pending taps and tears the
+// call down with cause.
+func (e *Engine) respondInboundFromLegError(call *Call, legErr error, cause string) {
+	var dialErr *sipgo.ErrDialogResponse
+	if errors.As(legErr, &dialErr) {
+		status := mapFailureStatus(failureReject, dialErr.Res.StatusCode)
+		_ = call.inbound.session.Respond(status, dialErr.Res.Reason, dialErr.Res.Body(),
+			relayableResponseHeaders(dialErr.Res, dialErr.Res.Body())...)
+	} else {
+		_ = call.inbound.session.Respond(mapFailureStatus(failureTimeout, 0), "Service Unavailable", nil)
+	}
+	releasePendingTaps(call, e.ports)
+	call.teardown(cause)
+}
+
+// mediaReleaser builds the call's releaseMedia hook: it closes the media session
+// (sockets and any secured leg) and returns every port pair — the fixed ep/pbx pairs
+// passed in plus each registered tap's pair — to the allocator. Centralizing the tap
+// loop keeps the three setup paths from each re-deriving (and risking dropping) it.
+func mediaReleaser(sess *MediaSession, ports *PortAllocator, fixed ...PortPair) func() {
+	return func() {
+		sess.Close()
+		for _, p := range fixed {
+			ports.Release(p)
+		}
+		for _, t := range sess.tapList() {
+			ports.Release(t.callerPair)
+			ports.Release(t.calleePair)
+		}
+	}
 }
 
 // handleInvite is the INVITE handler. It accepts the inbound dialog, creates a
@@ -96,6 +155,11 @@ func (e *Engine) handleInvite(req *sip.Request, tx sip.ServerTransaction) {
 
 	dss.OnState(func(s sip.DialogState) {
 		if s == sip.DialogStateEnded {
+			// After a REFER transfer the inbound leg is detached and BYE'd on purpose;
+			// its end must not collapse the transferred call.
+			if call.inboundTeardownSuppressed() {
+				return
+			}
 			call.teardown("inbound dialog ended")
 		}
 	})
@@ -259,18 +323,9 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 			}
 		}
 
-		// Transport switch: a tls app dials over its profile's per-profile dialer with a
-		// connect-timeout-bounded context; any other transport keeps the forced-TCP plain
-		// dialer unchanged. The single transport value selects the path.
-		cache := e.dialogCliCache
-		dialCtx, dialCancel := ctx, context.CancelFunc(func() {})
-		if app.Transport == config.TransportTLS {
-			appURI = withTransport(appURI, "tls")
-			cache = e.tlsDialers[app.TLSProfile]
-			dialCtx, dialCancel = dialContext(ctx, app.Resolved)
-		} else {
-			appURI = withTCP(appURI)
-		}
+		// A plain application leg always runs over TCP (the tap-mode offer can exceed
+		// sipgo's UDP MTU guard); a tls app dials over its profile's per-profile dialer.
+		cache, appURI, dialCtx, dialCancel := e.dialerFor(ctx, appURI, app.Transport, app.TLSProfile, app.Resolved, "tcp")
 
 		appLegID := newLegID()
 		appHeaders := append(call.forwardHeaders(),
@@ -292,15 +347,7 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 		}
 
 		legCtx, legCancel := context.WithTimeout(ctx, e.legTimeout)
-		appErr := appSess.WaitAnswer(legCtx, sipgo.AnswerOptions{
-			OnResponse: func(res *sip.Response) error {
-				if res.IsProvisional() && res.StatusCode != 100 {
-					_ = call.inbound.session.Respond(res.StatusCode, res.Reason, res.Body(),
-						relayableResponseHeaders(res, res.Body())...)
-				}
-				return nil
-			},
-		})
+		appErr := appSess.WaitAnswer(legCtx, call.relayProvisional())
 		legCancel()
 
 		if appErr != nil {
@@ -310,16 +357,7 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 			e.metrics.AppFailure(app.Name)
 			slog.Warn("application failed", "name", app.Name, "uri", app.URI, "policy", app.OnFailure, "stage", "answer", "err", appErr)
 			if failureAction(app.OnFailure) == actionAbort {
-				var dialErr *sipgo.ErrDialogResponse
-				if errors.As(appErr, &dialErr) {
-					status := mapFailureStatus(failureReject, dialErr.Res.StatusCode)
-					_ = call.inbound.session.Respond(status, dialErr.Res.Reason, dialErr.Res.Body(),
-						relayableResponseHeaders(dialErr.Res, dialErr.Res.Body())...)
-				} else {
-					_ = call.inbound.session.Respond(mapFailureStatus(failureTimeout, 0), "Service Unavailable", nil)
-				}
-				releasePendingTaps(call, e.ports)
-				call.teardown(fmt.Sprintf("app leg %q failed: %v", app.URI, appErr))
+				e.respondInboundFromLegError(call, appErr, fmt.Sprintf("app leg %q failed: %v", app.URI, appErr))
 				return false
 			}
 			continue
@@ -452,18 +490,9 @@ func (e *Engine) anchorMedia(call *Call) (mediaAnchor, bool) {
 	// Register release hook so teardown cleans up even on mid-setup failure.
 	// Tap pairs are released here too (they are on mediaSess.taps after registration).
 	mediaSess := &MediaSession{endpointSide: epSide, pbxSide: pbxSide}
-	ports := e.ports
 	call.mu.Lock()
 	call.media = mediaSess
-	call.releaseMedia = func() {
-		mediaSess.Close()
-		ports.Release(epPair)
-		ports.Release(pbxPair)
-		for _, t := range mediaSess.tapList() {
-			ports.Release(t.callerPair)
-			ports.Release(t.calleePair)
-		}
-	}
+	call.releaseMedia = mediaReleaser(mediaSess, e.ports, epPair, pbxPair)
 	call.mu.Unlock()
 
 	return mediaAnchor{session: mediaSess, pbxSide: pbxSide, epPair: epPair, pbxPair: pbxPair}, true
@@ -485,16 +514,9 @@ func (e *Engine) anchorWebRTC(call *Call) (mediaAnchor, bool) {
 	}
 
 	mediaSess := &MediaSession{endpointLeg: leg}
-	ports := e.ports
 	call.mu.Lock()
 	call.media = mediaSess
-	call.releaseMedia = func() {
-		mediaSess.Close()
-		for _, t := range mediaSess.tapList() {
-			ports.Release(t.callerPair)
-			ports.Release(t.calleePair)
-		}
-	}
+	call.releaseMedia = mediaReleaser(mediaSess, e.ports)
 	call.mu.Unlock()
 
 	return mediaAnchor{session: mediaSess, securedLeg: leg}, true
@@ -554,17 +576,9 @@ func (e *Engine) bridgeSecuredToPBX(ctx context.Context, call *Call, anchor medi
 	// Register the PBX side on the existing media session (the secured endpoint leg is
 	// already set) and extend the release hook to free the PBX pair on teardown.
 	sess := anchor.session
-	ports := e.ports
 	call.mu.Lock()
 	sess.pbxSide = pbxSide
-	call.releaseMedia = func() {
-		sess.Close()
-		ports.Release(pbxPair)
-		for _, t := range sess.tapList() {
-			ports.Release(t.callerPair)
-			ports.Release(t.calleePair)
-		}
-	}
+	call.releaseMedia = mediaReleaser(sess, e.ports, pbxPair)
 	call.mu.Unlock()
 
 	// Plain RTP/AVP offer toward the PBX: same codecs, no ICE/DTLS/rtcp-mux.
@@ -625,19 +639,13 @@ func (e *Engine) originatePBX(ctx context.Context, call *Call, pbxOffer []byte) 
 		return nil, nil, false
 	}
 
-	// Next-hop transport switch: tls dials over its profile's per-profile dialer with a
-	// connect-timeout-bounded context; tcp forces transport=tcp on the plain dialer;
-	// udp/unset keeps today's plain UDP path unchanged.
-	cache := e.dialogCliCache
-	dialCtx, dialCancel := ctx, context.CancelFunc(func() {})
-	switch e.cfg.NextHop.Transport {
-	case config.TransportTLS:
-		pbxURI = withTransport(pbxURI, "tls")
-		cache = e.tlsDialers[e.cfg.NextHop.TLSProfile]
-		dialCtx, dialCancel = dialContext(ctx, e.cfg.NextHop.Resolved)
-	case config.TransportTCP:
-		pbxURI = withTransport(pbxURI, "tcp")
+	// The next hop honors its configured transport: tls over the per-profile dialer, tcp
+	// forced onto the URI, udp/unset left as plain UDP.
+	plainTransport := ""
+	if e.cfg.NextHop.Transport == config.TransportTCP {
+		plainTransport = "tcp"
 	}
+	cache, pbxURI, dialCtx, dialCancel := e.dialerFor(ctx, pbxURI, e.cfg.NextHop.Transport, e.cfg.NextHop.TLSProfile, e.cfg.NextHop.Resolved, plainTransport)
 
 	pbxLegID := newLegID()
 	pbxHeaders := append(call.forwardHeaders(),
@@ -661,29 +669,12 @@ func (e *Engine) originatePBX(ctx context.Context, call *Call, pbxOffer []byte) 
 	call.mu.Unlock()
 
 	legCtx, legCancel := context.WithTimeout(ctx, e.legTimeout)
-	pbxErr := pbxSess.WaitAnswer(legCtx, sipgo.AnswerOptions{
-		OnResponse: func(res *sip.Response) error {
-			if res.IsProvisional() && res.StatusCode != 100 {
-				_ = call.inbound.session.Respond(res.StatusCode, res.Reason, res.Body(),
-					relayableResponseHeaders(res, res.Body())...)
-			}
-			return nil
-		},
-	})
+	pbxErr := pbxSess.WaitAnswer(legCtx, call.relayProvisional())
 	legCancel()
 
 	if pbxErr != nil {
 		e.metrics.TerminatingHopFailure()
-		var dialErr *sipgo.ErrDialogResponse
-		if errors.As(pbxErr, &dialErr) {
-			status := mapFailureStatus(failureReject, dialErr.Res.StatusCode)
-			_ = call.inbound.session.Respond(status, dialErr.Res.Reason, dialErr.Res.Body(),
-				relayableResponseHeaders(dialErr.Res, dialErr.Res.Body())...)
-		} else {
-			_ = call.inbound.session.Respond(mapFailureStatus(failureTimeout, 0), "Service Unavailable", nil)
-		}
-		releasePendingTaps(call, e.ports)
-		call.teardown(fmt.Sprintf("pbx leg failed: %v", pbxErr))
+		e.respondInboundFromLegError(call, pbxErr, fmt.Sprintf("pbx leg failed: %v", pbxErr))
 		return nil, nil, false
 	}
 
@@ -744,6 +735,21 @@ func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, st
 		return false
 	}
 
+	// Mark established and register taps BEFORE sending 200 OK, so an immediate
+	// in-dialog re-INVITE/REFER from the endpoint is handled (not 403/481'd) the
+	// instant it learns the call is up. Mirrors answerSecuredEndpoint; doing this after
+	// the 200 leaves a window where the caller's mid-dialog request races the
+	// transition and is rejected.
+	call.mu.Lock()
+	if canTransition(call.state, stateEstablished) {
+		call.state = stateEstablished
+	}
+	for _, pt := range call.pendingTaps {
+		anchor.session.addTap(pt.tap)
+	}
+	call.pendingTaps = nil
+	call.mu.Unlock()
+
 	// answer the endpoint with the anchored SDP, relaying the PBX 200's headers
 	if err := call.inbound.session.Respond(200, "OK", epAnswerSDP,
 		relayableResponseHeaders(pbxResp, epAnswerSDP)...); err != nil {
@@ -754,17 +760,6 @@ func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, st
 	}
 
 	e.metrics.ObserveSequencingLatency(time.Since(start))
-
-	call.mu.Lock()
-	if canTransition(call.state, stateEstablished) {
-		call.state = stateEstablished
-	}
-	// Register all pending taps on the media session before relay starts.
-	for _, pt := range call.pendingTaps {
-		anchor.session.addTap(pt.tap)
-	}
-	call.pendingTaps = nil
-	call.mu.Unlock()
 
 	return true
 }

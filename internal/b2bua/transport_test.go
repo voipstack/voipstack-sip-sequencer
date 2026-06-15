@@ -118,19 +118,3 @@ func TestAppInviteUsesTCP(t *testing.T) {
 		t.Fatalf("expected 1 active call, got %d", n)
 	}
 }
-
-// withTCP forces transport=tcp regardless of any existing value on the URI.
-func TestWithTCPForcesTransport(t *testing.T) {
-	cases := []string{"sip:asr@127.0.0.1:6060", "sip:asr@127.0.0.1:6060;transport=udp"}
-	for _, raw := range cases {
-		var u sip.Uri
-		if err := sip.ParseUri(raw, &u); err != nil {
-			t.Fatalf("parse %q: %v", raw, err)
-		}
-		got := withTCP(u)
-		tran, ok := got.UriParams.Get("transport")
-		if !ok || tran != "tcp" {
-			t.Fatalf("withTCP(%q): transport=%q present=%v, want tcp", raw, tran, ok)
-		}
-	}
-}

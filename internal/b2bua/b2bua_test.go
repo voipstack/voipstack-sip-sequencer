@@ -48,18 +48,10 @@ func newFakeUAS(t *testing.T) *fakeUAS {
 
 	// Serve both UDP and TCP on the same port: the app leg is always reached over
 	// TCP (engine-forced), the PBX leg over UDP, and the same fake fills both roles.
-	l, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("fakeUAS listen udp: %v", err)
-	}
+	l, tl := listenSamePort(t)
 	addr := l.LocalAddr().String()
 	host, portStr, _ := net.SplitHostPort(addr)
 	port, _ := strconv.Atoi(portStr)
-
-	tl, err := net.Listen("tcp", addr)
-	if err != nil {
-		t.Fatalf("fakeUAS listen tcp: %v", err)
-	}
 
 	contact := sip.ContactHeader{Address: sip.Uri{Host: host, Port: port}}
 	dsc := sipgo.NewDialogServerCache(cli, contact)
@@ -182,6 +174,28 @@ func (f *fakeUAC) invite(ctx context.Context, targetURI string, sdp []byte) (*si
 }
 
 // ── engine test helpers ───────────────────────────────────────────────────────
+
+// listenSamePort binds a UDP socket and a TCP listener on the same ephemeral 127.0.0.1
+// port and returns both, held open. The UDP bind picks the port, but a parallel test can
+// already hold that port for TCP, so it retries with a fresh port on a TCP-bind collision.
+// Holding both (rather than bind-release-rebind) removes the TOCTOU window entirely — the
+// caller serves directly on the returned listeners.
+func listenSamePort(t *testing.T) (net.PacketConn, net.Listener) {
+	t.Helper()
+	for attempt := 0; attempt < 20; attempt++ {
+		l, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listenSamePort udp: %v", err)
+		}
+		tl, err := net.Listen("tcp", l.LocalAddr().String())
+		if err == nil {
+			return l, tl
+		}
+		l.Close() // port held for TCP by another binder; retry with a fresh one
+	}
+	t.Fatal("listenSamePort: no shared udp+tcp port after 20 attempts")
+	return nil, nil
+}
 
 // freeAddr grabs a UDP port and releases it for the engine to bind.
 // There is a small TOCTOU race; acceptable in test contexts.
