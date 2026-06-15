@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -106,20 +105,31 @@ func freeRTPRange(tb testing.TB) string {
 	return freeRTPRangeSpan(tb, 10)
 }
 
-// freeRTPRangeSpan returns an even-bounded "min-max" with the given span — used by
-// scenarios (e.g. several tap apps) that need more than the default pair count.
+// freeRTPRangeSpan returns an even-bounded "min-max" with the given span, chosen
+// from a low fixed window BELOW the OS ephemeral pool (32768–60999 on Linux). The
+// engine binds a UDP socket for every pair in this range; if the range overlapped
+// the ephemeral pool, the engine's or the test's own ephemeral sockets would land
+// inside it and bind() would collide (engine returns 500 "media bind failed") — most
+// visibly under concurrent calls. A low dedicated window is collision-free.
+//
+// Tests in this package run sequentially (no t.Parallel) and each subprocess is
+// SIGTERM'd on cleanup, so reusing the window across tests is safe. Two simultaneous
+// `go test` runs of this one package could collide on it; acceptable for a helper.
 func freeRTPRangeSpan(tb testing.TB, span int) string {
 	tb.Helper()
-	addr := freeUDPPort(tb)
-	_, portStr, _ := net.SplitHostPort(addr)
-	base, _ := strconv.Atoi(portStr)
-	if base%2 != 0 {
-		base++
-	}
 	if span%2 != 0 {
 		span++
 	}
-	return fmt.Sprintf("%d-%d", base, base+span)
+	for base := 20000; base+span < 30000; base += span + 2 {
+		l, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: base})
+		if err != nil {
+			continue // base in use; try the next window
+		}
+		l.Close()
+		return fmt.Sprintf("%d-%d", base, base+span)
+	}
+	tb.Fatal("freeRTPRangeSpan: no free low RTP window")
+	return ""
 }
 
 // deadAddr reserves a TCP port and releases it, yielding a SIP URI that refuses
@@ -322,35 +332,49 @@ func start(t *testing.T, cfgPath, sipListen, obsListen string) *sequencer {
 	return s
 }
 
-// startReady starts the binary and blocks until /health reports 200 or the
-// process exits early (failing the test with captured stderr).
+// startReady starts the binary and blocks until /health reports 200. The
+// subprocess-owned ports (sip.listen, observability.listen) are picked pick-close-
+// rebind, so a rare TOCTOU race can let another socket grab one before the child
+// binds it, exiting the child with "address already in use". On a non-ready start it
+// re-picks those ports and relaunches a few times before failing.
 func startReady(t *testing.T, cfg yamlConfig) *sequencer {
 	t.Helper()
-	dir := t.TempDir()
-	cfgPath := writeConfig(t, dir, cfg)
-	s := start(t, cfgPath, cfg.SIPListen, cfg.ObsListen)
-	s.waitReady(t, 5*time.Second)
-	return s
+	const attempts = 3
+	var lastStderr string
+	for i := 0; i < attempts; i++ {
+		dir := t.TempDir()
+		cfgPath := writeConfig(t, dir, cfg)
+		s := start(t, cfgPath, cfg.SIPListen, cfg.ObsListen)
+		if s.tryReady(5 * time.Second) {
+			return s
+		}
+		lastStderr = s.stderr.String()
+		s.stop() // ensure the failed child is gone before re-picking ports
+		cfg.SIPListen = freeUDPPort(t)
+		cfg.ObsListen = freeTCPPort(t)
+	}
+	t.Fatalf("sequencer not ready after %d attempts\nlast stderr:\n%s", attempts, lastStderr)
+	return nil
 }
 
-// waitReady polls /health until it returns 200, failing fast if the process exits
-// before becoming ready.
-func (s *sequencer) waitReady(t *testing.T, timeout time.Duration) {
-	t.Helper()
+// tryReady polls /health until it returns 200, returning false (rather than failing
+// the test) if the process exits early or the timeout elapses — so startReady can
+// retry. The whole window is bounded by timeout.
+func (s *sequencer) tryReady(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	url := "http://" + s.obsListen + "/health"
 	for time.Now().Before(deadline) {
 		select {
-		case <-s.done:
-			t.Fatalf("process exited before ready: %v\nstderr:\n%s", s.exitErr, s.stderr.String())
+		case <-s.done: // exited before becoming ready
+			return false
 		default:
 		}
 		if status, body, err := httpGet(url); err == nil && status == http.StatusOK && body == "ok" {
-			return
+			return true
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatalf("sequencer not ready within %s\nstderr:\n%s", timeout, s.stderr.String())
+	return false
 }
 
 // stop sends SIGTERM (the signal main.go traps for graceful Shutdown), waits

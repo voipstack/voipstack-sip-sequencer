@@ -39,6 +39,11 @@ deb: build
 test:
 	$(GO) test -race ./...
 
+# Black-box e2e suite: compiles the binary and drives it as a subprocess. Gated
+# behind the `e2e` build tag so the default `test` target stays fast.
+test-e2e:
+	$(GO) test -tags e2e -race ./test/e2e/...
+
 clean:
 	rm -rf $(DIST)
 

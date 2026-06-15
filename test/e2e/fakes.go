@@ -65,19 +65,12 @@ func newFakeUAS(t *testing.T) *fakeUAS {
 	}
 
 	// Serve both UDP and TCP on the same port: the app leg is reached over TCP
-	// (engine-forced), the PBX leg over UDP, and one fake fills both roles.
-	l, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("fakeUAS listen udp: %v", err)
-	}
-	addr := l.LocalAddr().String()
+	// (engine-forced), the PBX leg over UDP, and one fake fills both roles. Binding
+	// UDP :0 then TCP on that same port has a race — another socket can grab the TCP
+	// port in between — so retry the pairing until both bind on one port.
+	l, tl, addr := bindUDPAndTCP(t)
 	host, portStr, _ := net.SplitHostPort(addr)
 	port, _ := strconv.Atoi(portStr)
-
-	tl, err := net.Listen("tcp", addr)
-	if err != nil {
-		t.Fatalf("fakeUAS listen tcp: %v", err)
-	}
 
 	contact := sip.ContactHeader{Address: sip.Uri{Host: host, Port: port}}
 	dsc := sipgo.NewDialogServerCache(cli, contact)
@@ -87,7 +80,6 @@ func newFakeUAS(t *testing.T) *fakeUAS {
 
 	go srv.ServeUDP(l)  //nolint:errcheck
 	go srv.ServeTCP(tl) //nolint:errcheck
-	t.Cleanup(func() { l.Close(); tl.Close() })
 
 	return f
 }
@@ -124,6 +116,29 @@ func (f *fakeUAS) installHandlers(srv *sipgo.Server, dsc *sipgo.DialogServerCach
 	srv.OnCancel(func(req *sip.Request, tx sip.ServerTransaction) {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 	})
+}
+
+// bindUDPAndTCP returns a UDP and a TCP listener bound to the same 127.0.0.1 port,
+// retrying with a fresh port when the TCP bind loses the race for the UDP-chosen
+// port. Both are registered for cleanup.
+func bindUDPAndTCP(t *testing.T) (net.PacketConn, net.Listener, string) {
+	t.Helper()
+	for attempt := 0; attempt < 50; attempt++ {
+		l, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("fakeUAS listen udp: %v", err)
+		}
+		addr := l.LocalAddr().String()
+		tl, err := net.Listen("tcp", addr)
+		if err != nil {
+			l.Close() // TCP port taken; try another
+			continue
+		}
+		t.Cleanup(func() { l.Close(); tl.Close() })
+		return l, tl, addr
+	}
+	t.Fatal("bindUDPAndTCP: no free UDP+TCP port pair after retries")
+	return nil, nil, ""
 }
 
 func (f *fakeUAS) sipURI() string { return "sip:" + f.addr }
