@@ -54,8 +54,12 @@ func (e *Engine) handleRefer(req *sip.Request, tx sip.ServerTransaction) {
 		e.sendReferNotify(inboundSession, "SIP/2.0 400 Bad Request")
 		return
 	}
+	// Refer-To is a name-addr or addr-spec (RFC 3515): a real client sends
+	// "<sip:target>" (optionally with a display name), so the angle brackets must be
+	// stripped before the URI parses. ParseAddressValue handles both forms.
 	var targetURI sip.Uri
-	if err := sip.ParseUri(referToHdr.Value(), &targetURI); err != nil {
+	var referParams sip.HeaderParams
+	if _, err := sip.ParseAddressValue(referToHdr.Value(), &targetURI, &referParams); err != nil {
 		slog.Warn("REFER: parse Refer-To", "callID", call.id, "err", err)
 		e.sendReferNotify(inboundSession, "SIP/2.0 400 Bad Request")
 		return
@@ -124,8 +128,13 @@ func (e *Engine) handleRefer(req *sip.Request, tx sip.ServerTransaction) {
 		}
 	})
 
-	// Notify referrer of success, then BYE them (transfer complete).
+	// Notify referrer of success, then BYE them (transfer complete). Detach the inbound
+	// leg first: BYEing it ends the inbound dialog, whose OnState(Ended) hook would
+	// otherwise tear the whole call down — dropping the call we just transferred. The
+	// call now lives through the transfer target and PBX legs (each with its own hook).
 	e.sendReferNotify(inboundSession, "SIP/2.0 200 OK")
+
+	call.detachInbound()
 
 	byeCtx, byeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer byeCancel()

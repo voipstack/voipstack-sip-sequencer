@@ -296,8 +296,11 @@ func copyUDPFanout(ctx context.Context, readConn, writeConn *net.UDPConn, primar
 		}
 
 		for _, tap := range tapSides {
+			if tap == nil {
+				continue
+			}
 			tapDst := tap.loadRemoteRTP()
-			if tap == nil || tapDst == nil {
+			if tapDst == nil {
 				continue
 			}
 			if _, err := tap.rtpConn.WriteTo(pkt, tapDst); err != nil {

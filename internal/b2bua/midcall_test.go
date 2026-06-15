@@ -591,51 +591,190 @@ func TestReferRepointsEndpointLegKeepsChain(t *testing.T) {
 	}
 	eng.calls.mu.Unlock()
 
-	// Target answers new leg if REFER succeeds and reaches it.
-	// Uses a plain channel select so the goroutine exits cleanly if REFER fails.
+	// Transfer target answers the new leg the REFER originates.
 	go func() {
 		select {
 		case dss := <-target.invites:
 			_ = dss.Respond(200, "OK", []byte(testSDP2))
 		case <-time.After(4 * time.Second):
-			// REFER may have failed or not reached target; harmless no-op.
 		}
 	}()
 
-	// Send REFER from caller session. sipgo's DialogClientSession supports Do for REFER.
-	referURI := target.sipURI()
+	// Send REFER from the caller session. It must be accepted (202), not skipped.
 	referReq := sip.NewRequest(sip.REFER, sess.InviteResponse.Contact().Address)
-	referReq.AppendHeader(sip.NewHeader("Refer-To", referURI))
+	referReq.AppendHeader(sip.NewHeader("Refer-To", target.sipURI()))
 	referRes, err := sess.Do(ctx, referReq)
 	if err != nil {
-		t.Logf("REFER send: %v (may fail if sipgo client-side REFER not supported; skipping REFER flow check)", err)
-		// If client-side REFER send is not supported, skip the REFER flow assertion
-		// but verify the call state is untouched.
-	} else if referRes.StatusCode != 202 {
-		t.Logf("REFER response: %d (expected 202; skipping flow check)", referRes.StatusCode)
+		t.Fatalf("REFER send: %v", err)
+	}
+	if referRes.StatusCode != 202 {
+		t.Fatalf("REFER status: got %d, want 202", referRes.StatusCode)
 	}
 
+	// Allow the transfer to complete (target answer, NOTIFY, referrer BYE).
+	time.Sleep(500 * time.Millisecond)
+
+	// The call must still be registered (not vacuously absent): snapshot it explicitly.
+	var calls []*Call
+	eng.calls.mu.Lock()
+	for _, c := range eng.calls.m {
+		calls = append(calls, c)
+	}
+	eng.calls.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("after REFER: registry has %d calls, want 1 (transfer must keep the call alive)", len(calls))
+	}
+
+	// The transfer repoints endpoint media but never re-runs the chain: appLegs and
+	// pbxLeg pointers, and the correlation call ID, are unchanged; transferTarget is set.
+	c := calls[0]
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.id != origCallID {
+		t.Errorf("Call.id changed after REFER: got %q, want %q", c.id, origCallID)
+	}
+	if len(c.appLegs) != len(origAppLegs) {
+		t.Errorf("appLegs count changed: got %d, want %d", len(c.appLegs), len(origAppLegs))
+	}
+	for i, leg := range c.appLegs {
+		if leg != origAppLegs[i] {
+			t.Errorf("appLegs[%d] pointer changed", i)
+		}
+	}
+	if c.pbxLeg != origPBXLeg {
+		t.Error("pbxLeg pointer changed after REFER")
+	}
+	if c.transferTarget == nil {
+		t.Error("transferTarget not set: REFER transfer did not complete")
+	}
+}
+
+// TestReferTransferKeepsCallAlive proves a successful blind transfer leaves the call
+// up: the referrer (inbound) leg is released, but the bridged transfer-target<->PBX
+// media stays anchored and the call stays registered. The bug it guards: BYEing the
+// referrer fired the inbound dialog's OnState(Ended) hook, which tore the whole call
+// down — dropping the just-transferred call. The earlier
+// TestReferRepointsEndpointLegKeepsChain cannot catch this: it iterates eng.calls.m,
+// so an emptied registry makes its assertions pass vacuously.
+func TestReferTransferKeepsCallAlive(t *testing.T) {
+	app := newFakeUAS(t)
+	pbx := newFakeUAS(t)
+	target := newFakeUAS(t)
+	caller := newFakeUAC(t)
+
+	listenAddr := freeAddr(t)
+	eng := startEngine(t, testConfig(listenAddr, app.sipURI(), pbx.sipURI()), 0)
+	ctx := context.Background()
+
+	autoAnswer(t, app, "", nil)
+	autoAnswer(t, pbx, "", nil)
+
+	sess, err := caller.invite(ctx, "sip:"+listenAddr, []byte(testSDP))
+	if err != nil {
+		t.Fatalf("invite: %v", err)
+	}
+	if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("WaitAnswer: %v", err)
+	}
+	if err := sess.Ack(ctx); err != nil {
+		t.Fatalf("ACK: %v", err)
+	}
+	// Let the established-state transition (set just after the inbound 200) settle
+	// before the in-dialog REFER, so the REFER is accepted (202) rather than 403'd.
 	time.Sleep(200 * time.Millisecond)
 
-	// Verify appLegs and pbxLeg pointers unchanged; call ID unchanged.
+	// Transfer target answers the new leg the REFER originates.
+	go func() {
+		select {
+		case dss := <-target.invites:
+			_ = dss.Respond(200, "OK", []byte(testSDP2))
+		case <-time.After(4 * time.Second):
+		}
+	}()
+
+	// REFER the caller to the transfer target.
+	referReq := sip.NewRequest(sip.REFER, sess.InviteResponse.Contact().Address)
+	referReq.AppendHeader(sip.NewHeader("Refer-To", target.sipURI()))
+	referRes, err := sess.Do(ctx, referReq)
+	if err != nil {
+		t.Fatalf("REFER send: %v", err)
+	}
+	if referRes.StatusCode != 202 {
+		t.Fatalf("REFER status: got %d, want 202", referRes.StatusCode)
+	}
+
+	// The transfer completes asynchronously (target answer, NOTIFY, referrer BYE).
+	// The call must survive the referrer BYE — it must never drop out of the registry.
+	for i := 0; i < 20; i++ {
+		if n := eng.calls.len(); n == 0 {
+			t.Fatalf("call torn down after REFER transfer: registry emptied (iteration %d)", i)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Guard against a vacuous pass: the transfer must have actually completed
+	// (target leg recorded as the transfer target), proving the referrer-BYE path ran.
+	var sawTransfer bool
 	eng.calls.mu.Lock()
 	for _, c := range eng.calls.m {
 		c.mu.Lock()
-		if c.id != origCallID {
-			t.Errorf("Call.id changed after REFER: got %q, want %q", c.id, origCallID)
-		}
-		if len(c.appLegs) != len(origAppLegs) {
-			t.Errorf("appLegs count changed: got %d, want %d", len(c.appLegs), len(origAppLegs))
-		}
-		for i, leg := range c.appLegs {
-			if leg != origAppLegs[i] {
-				t.Errorf("appLegs[%d] pointer changed", i)
-			}
-		}
-		if c.pbxLeg != origPBXLeg {
-			t.Error("pbxLeg pointer changed after REFER")
+		if c.transferTarget != nil {
+			sawTransfer = true
 		}
 		c.mu.Unlock()
 	}
 	eng.calls.mu.Unlock()
+	if !sawTransfer {
+		t.Fatal("REFER did not complete: no transferTarget recorded (test would pass vacuously)")
+	}
+}
+
+// TestReferImmediatelyAfterAnswerAccepted proves an in-dialog REFER sent the instant
+// the caller learns the call is up is accepted (202), not 403'd. The bug it guards:
+// the plain bridge path marked the call established AFTER sending the inbound 200, so a
+// REFER racing into that window saw state != established and was rejected 403. The
+// established transition must happen before the 200, as the secured path already does.
+func TestReferImmediatelyAfterAnswerAccepted(t *testing.T) {
+	app := newFakeUAS(t)
+	pbx := newFakeUAS(t)
+	target := newFakeUAS(t)
+	caller := newFakeUAC(t)
+
+	listenAddr := freeAddr(t)
+	startEngine(t, testConfig(listenAddr, app.sipURI(), pbx.sipURI()), 0)
+	ctx := context.Background()
+
+	autoAnswer(t, app, "", nil)
+	autoAnswer(t, pbx, "", nil)
+	autoAnswer(t, target, "", nil)
+
+	// Each iteration establishes a fresh call and fires REFER with no settle, hitting
+	// the post-200/pre-established window. One iteration is flaky to reproduce; the
+	// loop makes the rejection near-certain when the bug is present, while a correct
+	// (established-before-200) implementation is deterministically 202 every time.
+	for i := 0; i < 8; i++ {
+		sess, err := caller.invite(ctx, "sip:"+listenAddr, []byte(testSDP))
+		if err != nil {
+			t.Fatalf("iter %d: invite: %v", i, err)
+		}
+		if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
+			t.Fatalf("iter %d: WaitAnswer: %v", i, err)
+		}
+		if err := sess.Ack(ctx); err != nil {
+			t.Fatalf("iter %d: ACK: %v", i, err)
+		}
+
+		referReq := sip.NewRequest(sip.REFER, sess.InviteResponse.Contact().Address)
+		referReq.AppendHeader(sip.NewHeader("Refer-To", target.sipURI()))
+		referRes, err := sess.Do(ctx, referReq)
+		if err != nil {
+			t.Fatalf("iter %d: REFER send: %v", i, err)
+		}
+		if referRes.StatusCode == 403 {
+			t.Fatalf("iter %d: REFER 403'd: call not established when REFER arrived (established set after 200)", i)
+		}
+		if referRes.StatusCode != 202 {
+			t.Fatalf("iter %d: REFER status: got %d, want 202", i, referRes.StatusCode)
+		}
+	}
 }

@@ -379,6 +379,14 @@ func (e *Engine) startObservability(ctx context.Context) {
 			slog.Error("observability server", "addr", e.obsListen, "err", err)
 		}
 	}()
+	// Tie the server's lifetime to ctx, mirroring serveTLS: a Run-ctx cancel closes it
+	// even when Shutdown is not called explicitly, so the goroutine never outlives Run.
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = e.obsServer.Shutdown(shutCtx)
+	}()
 }
 
 // Shutdown tears down all active calls, stops the observability server, and

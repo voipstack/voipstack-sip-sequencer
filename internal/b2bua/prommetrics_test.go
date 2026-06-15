@@ -241,3 +241,61 @@ func TestHealthEndpointReportsLiveness(t *testing.T) {
 		t.Fatalf("/health body = %q, want %q", body, "ok")
 	}
 }
+
+// Given a running observability server; When the engine's Run context is cancelled
+// (without an explicit Shutdown); Then the server stops serving — its lifetime is tied
+// to ctx, so its goroutine never outlives Run.
+func TestObservabilityServerStopsOnContextCancel(t *testing.T) {
+	app := newFakeUAS(t)
+	pbx := newFakeUAS(t)
+
+	listenAddr := freeAddr(t)
+	obsAddr := freeTCPAddr(t)
+
+	eng, err := New(obsConfig(listenAddr, app.sipURI(), pbx.sipURI(), obsAddr))
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	eng.metrics = NewPromMetrics()
+
+	ready := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		rctx := context.WithValue(ctx, sipgo.ListenReadyCtxKey,
+			sipgo.ListenReadyFuncCtxValue(func(_, _ string) { close(ready) }))
+		_ = eng.Run(rctx)
+	}()
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("engine did not start in time")
+	}
+
+	// Server is up.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if status, _ := scrape(t, obsAddr, "/health"); status == http.StatusOK {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if status, _ := scrape(t, obsAddr, "/health"); status != http.StatusOK {
+		t.Fatalf("/health not up before cancel: status %d", status)
+	}
+
+	// Cancel the Run context only — no Shutdown call — and assert the server stops.
+	cancel()
+	stopped := false
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if status, _ := scrape(t, obsAddr, "/health"); status == 0 {
+			stopped = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !stopped {
+		t.Fatal("observability server still serving after Run-ctx cancel (goroutine outlived Run)")
+	}
+}
