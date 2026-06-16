@@ -606,6 +606,11 @@ func (e *Engine) bridgeSecuredToPBX(ctx context.Context, call *Call, anchor medi
 		&net.UDPAddr{IP: net.ParseIP(pbxHost), Port: pbxRTPPort + 1},
 	)
 
+	// Both legs are now negotiated: the WebRTC endpoint answered one codec and the PBX
+	// another may differ. Surface a mismatch (logging/metric only) — the secured↔plain
+	// bridge forwards RTP byte-for-byte and never transcodes.
+	e.reportCodecAgreement(call, anchor.securedLeg.AnswerSDP(), pbxAnswerRaw)
+
 	// Answer the webphone with the secured leg's ICE-lite/DTLS-SRTP SDP (registers taps,
 	// transitions the call to established).
 	if !e.answerSecuredEndpoint(call, anchor, start) {
@@ -697,6 +702,45 @@ func (e *Engine) originatePBX(ctx context.Context, call *Call, pbxOffer []byte) 
 	return pbxResp, pbxAnswerRaw, true
 }
 
+// reportCodecAgreement compares the agreed audio codec on the two anchored legs and,
+// when they differ, emits one ERROR log and increments the mismatch metric: the
+// sequencer never transcodes, so legs that disagree relay undecodable RTP and the call
+// is connected but silent. Matching legs log at debug. This is logging only — it never
+// changes the call flow; an SDP that does not parse logs at debug and is treated as
+// "cannot tell", not as a mismatch. endpointSDP and pbxSDP are each leg's final
+// negotiated SDP (the endpoint answer and the PBX answer).
+func (e *Engine) reportCodecAgreement(call *Call, endpointSDP, pbxSDP []byte) {
+	ep, err := selectedAudioCodec(endpointSDP)
+	if err != nil {
+		slog.Debug("codec check: parse endpoint answer SDP", "call", call.id, "err", err)
+		return
+	}
+	pbx, err := selectedAudioCodec(pbxSDP)
+	if err != nil {
+		slog.Debug("codec check: parse pbx answer SDP", "call", call.id, "err", err)
+		return
+	}
+
+	pbxLegID := ""
+	call.mu.Lock()
+	if call.pbxLeg != nil {
+		pbxLegID = call.pbxLeg.legID
+	}
+	call.mu.Unlock()
+
+	if codecsMatch(ep, pbx) {
+		slog.Debug("anchored legs agree on audio codec",
+			"call", call.id, "codec", ep.Label(), "clock", ep.ClockRate)
+		return
+	}
+
+	slog.Error("media codec mismatch: call will have no usable audio (sequencer does not transcode)",
+		"call", call.id, "pbx_leg", pbxLegID,
+		"endpoint_codec", ep.Label(), "endpoint_pt", ep.PayloadType,
+		"pbx_codec", pbx.Label(), "pbx_pt", pbx.PayloadType)
+	e.metrics.MediaCodecMismatch(ep.Label(), pbx.Label())
+}
+
 // dialPBX originates the terminating PBX leg, anchors the PBX-side media from its
 // answer, answers the inbound caller with the anchored SDP, marks the call
 // established, and registers the stashed taps. It returns false when a failure
@@ -734,6 +778,9 @@ func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, st
 		e.fail(call, 500, "Server Error", "rewrite sdp: "+err.Error())
 		return false
 	}
+
+	// Both legs are now negotiated: surface a codec mismatch (logging/metric only).
+	e.reportCodecAgreement(call, epAnswerSDP, pbxAnswerRaw)
 
 	// Mark established and register taps BEFORE sending 200 OK, so an immediate
 	// in-dialog re-INVITE/REFER from the endpoint is handled (not 403/481'd) the

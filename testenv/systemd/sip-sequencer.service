@@ -1,0 +1,25 @@
+[Unit]
+Description=voipstack SIP sequencer (test box)
+After=network-online.target freeswitch.service
+Wants=network-online.target
+# StartLimit* belong in [Unit] (systemd warns if placed in [Service]).
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sip-sequencer --config /etc/voipstack-sip-sequencer/config.yaml
+Restart=on-failure
+RestartSec=2
+# >= the engine's 5s graceful-shutdown window so in-flight calls BYE cleanly.
+TimeoutStopSec=10
+
+# Listens on high ports (5070/8080/9090) so no privileged-bind capability needed.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/etc/voipstack-sip-sequencer
+
+[Install]
+WantedBy=multi-user.target

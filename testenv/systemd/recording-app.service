@@ -1,0 +1,21 @@
+[Unit]
+Description=voipstack recording application (tap in the sequencer chain)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# App legs are SIP over TCP; loopback only (reached by the sequencer at 127.0.0.1:6060).
+# StateDirectory gives the DynamicUser a writable /var/lib/recording-app for WAVs.
+ExecStart=/usr/local/bin/recording-app --listen 127.0.0.1:6060 --media-host 127.0.0.1 --dir /var/lib/recording-app
+Restart=on-failure
+RestartSec=2
+
+DynamicUser=yes
+NoNewPrivileges=yes
+StateDirectory=recording-app
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

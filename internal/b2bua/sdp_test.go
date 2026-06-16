@@ -234,6 +234,91 @@ func TestExtractAudioCodecs(t *testing.T) {
 	}
 }
 
+// ── selectedAudioCodec ────────────────────────────────────────────────────────
+
+func TestSelectedAudioCodec(t *testing.T) {
+	tests := []struct {
+		name     string
+		sdp      string
+		wantPT   int
+		wantName string
+		wantRate int
+		wantErr  bool
+	}{
+		{
+			name:     "opus dynamic with rtpmap",
+			sdp:      "v=0\r\nc=IN IP4 1.2.3.4\r\nm=audio 5000 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n",
+			wantPT:   111,
+			wantName: "opus",
+			wantRate: 48000,
+		},
+		{
+			name:     "G722 static no rtpmap falls back to table",
+			sdp:      "v=0\r\nc=IN IP4 1.2.3.4\r\nm=audio 5004 RTP/AVP 9\r\n",
+			wantPT:   9,
+			wantName: "G722",
+			wantRate: 8000,
+		},
+		{
+			name:     "PCMU static no rtpmap falls back to table",
+			sdp:      "v=0\r\nc=IN IP4 1.2.3.4\r\nm=audio 5004 RTP/AVP 0\r\n",
+			wantPT:   0,
+			wantName: "PCMU",
+			wantRate: 8000,
+		},
+		{
+			name:     "first format is the selected one",
+			sdp:      "v=0\r\nc=IN IP4 1.2.3.4\r\nm=audio 5004 RTP/AVP 8 0 101\r\na=rtpmap:8 PCMA/8000\r\na=rtpmap:101 telephone-event/8000\r\n",
+			wantPT:   8,
+			wantName: "PCMA",
+			wantRate: 8000,
+		},
+		{
+			name:    "no audio m= line",
+			sdp:     "v=0\r\nc=IN IP4 1.2.3.4\r\nm=video 5004 RTP/AVP 96\r\n",
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := selectedAudioCodec([]byte(tc.sdp))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %+v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.PayloadType != tc.wantPT || got.EncodingName != tc.wantName || got.ClockRate != tc.wantRate {
+				t.Fatalf("got %+v, want pt=%d name=%q rate=%d", got, tc.wantPT, tc.wantName, tc.wantRate)
+			}
+		})
+	}
+}
+
+func TestCodecsMatch(t *testing.T) {
+	opus111 := AudioCodec{PayloadType: 111, EncodingName: "opus", ClockRate: 48000}
+	opus96 := AudioCodec{PayloadType: 96, EncodingName: "OPUS", ClockRate: 48000}
+	g722 := AudioCodec{PayloadType: 9, EncodingName: "G722", ClockRate: 8000}
+	unknown96 := AudioCodec{PayloadType: 96}
+	unknown97 := AudioCodec{PayloadType: 97}
+
+	if !codecsMatch(opus111, opus96) {
+		t.Error("same codec, different payload type and case should match")
+	}
+	if codecsMatch(opus111, g722) {
+		t.Error("opus vs G722 must not match")
+	}
+	if !codecsMatch(unknown96, unknown96) {
+		t.Error("identical unknown payload type should match")
+	}
+	if codecsMatch(unknown96, unknown97) {
+		t.Error("different unknown payload types must not match")
+	}
+}
+
 // ── buildTapOffer ─────────────────────────────────────────────────────────────
 
 func TestBuildTapOffer(t *testing.T) {

@@ -1,0 +1,52 @@
+# Vagrantfile — local test box for voipstack-sip-sequencer.
+#
+# One Debian 12 VM running, side by side (all native, no containers):
+#   - FreeSWITCH (SignalWire pkg)        : PBX + registrar on :5060/udp
+#   - sip-sequencer (the proxy)          : SIP :5070/udp, WebSocket :8080
+#   - recording app (one tap in chain)   : SIP/TCP :6060 (loopback)
+#   - jsSIP webphone (static page)       : http :8090
+#
+# Two networks on purpose:
+#   * private_network 192.168.56.10  — softphones + RTP/ICE reach the box here.
+#   * forwarded_port localhost       — the browser hits the webphone/WS on
+#     http://localhost:8090 + ws://localhost:8080 so it gets a *secure context*
+#     (localhost counts as secure) and getUserMedia/WebRTC works without TLS.
+#
+# Start/stop:  vagrant up  /  vagrant halt   (services come up on boot)
+# Teardown:    vagrant destroy -f
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "debian/bookworm64"
+  config.vm.hostname = "sequencer-lab"
+
+  # Softphones + RTP/ICE talk to this IP. Must be a concrete IP (not 0.0.0.0):
+  # the sequencer advertises this host in SDP, Path, and ICE candidates.
+  config.vm.network "private_network", ip: "192.168.56.10"
+
+  # Browser-facing ports forwarded to host localhost for a WebRTC secure context.
+  config.vm.network "forwarded_port", guest: 8090, host: 8090, id: "webphone"   # static page
+  config.vm.network "forwarded_port", guest: 8080, host: 8080, id: "sip-ws"     # jsSIP WebSocket
+  config.vm.network "forwarded_port", guest: 9090, host: 9090, id: "metrics"    # /health + /metrics
+
+  # Repo root is mounted at /vagrant; the sequencer is built from it in-VM.
+  # 9p works under libvirt/KVM with no host NFS daemon (the default libvirt sync
+  # is NFS, which fails when the host has no NFSv3/udp server). For VirtualBox the
+  # 9p type is ignored and the default vboxsf mount is used instead.
+  config.vm.synced_folder "..", "/vagrant", type: "9p", accessmode: "squash"
+
+  config.vm.provider "libvirt" do |lv|
+    lv.cpus   = 2
+    lv.memory = 2048
+  end
+
+  config.vm.provider "virtualbox" do |vb|
+    vb.name   = "sequencer-lab"
+    vb.cpus   = 2
+    vb.memory = 2048
+  end
+
+  # FreeSWITCH installs natively from SignalWire's repo, which needs a free
+  # Personal Access Token. Export SIGNALWIRE_TOKEN on the host before `vagrant up`.
+  config.vm.provision "shell", path: "provision.sh",
+    env: { "SIGNALWIRE_TOKEN" => ENV.fetch("SIGNALWIRE_TOKEN", "") }
+end
