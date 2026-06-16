@@ -1067,6 +1067,7 @@ func (s *recordingSink) AppFailure(name string) {
 func (s *recordingSink) AppInvocation(string)                   {}
 func (s *recordingSink) TerminatingHopFailure()                 {}
 func (s *recordingSink) ObserveSequencingLatency(time.Duration) {}
+func (s *recordingSink) MediaCodecMismatch(string, string)      {}
 
 func (s *recordingSink) snapshot() []string {
 	s.mu.Lock()

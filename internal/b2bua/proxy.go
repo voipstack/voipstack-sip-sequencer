@@ -106,9 +106,15 @@ func (e *Engine) forwardAndRelay(req *sip.Request, tx sip.ServerTransaction, des
 			if !ok {
 				return
 			}
-			// Strip the proxy Via we added before relaying to the originator.
+			// Strip the proxy Via we added (RFC 3261 §16.7) before relaying to the
+			// originator, leaving the originator's Via(s) intact and once each.
+			// sipgo's RemoveHeader removes only the FIRST matching header, so removing
+			// the whole list takes a loop; removing just once would keep the
+			// originator's Via and then re-appending vias[1:] would duplicate it —
+			// a strict WS client (jsSIP) drops a response with more than one Via.
 			vias := res.GetHeaders("Via")
-			res.RemoveHeader("Via")
+			for res.RemoveHeader("Via") {
+			}
 			for _, v := range vias[1:] {
 				res.AppendHeader(v)
 			}

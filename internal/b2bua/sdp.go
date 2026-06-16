@@ -42,6 +42,117 @@ func extractAudioCodecs(callOffer []byte) (formats string, rtpmaps, fmtps []stri
 	return formats, rtpmaps, fmtps, nil
 }
 
+// AudioCodec is the agreed audio codec on one negotiated leg: the first payload type
+// on the first m=audio line, resolved to the encoding name and clock rate it maps to.
+type AudioCodec struct {
+	PayloadType  int
+	EncodingName string
+	ClockRate    int
+}
+
+// Label is a human/metric-friendly name for the codec: its encoding name when known,
+// or "pt<N>" for a payload type with neither an a=rtpmap nor a well-known static slot.
+func (c AudioCodec) Label() string {
+	if c.EncodingName != "" {
+		return c.EncodingName
+	}
+	return "pt" + strconv.Itoa(c.PayloadType)
+}
+
+// staticAudioRTPMap is the subset of the RFC 3551 static RTP/AVP audio payload types we
+// resolve when a negotiated SDP omits the a=rtpmap (legal for static types). It exists so
+// a PBX that answers, say, G722 (pt 9) with no rtpmap still yields a comparable codec.
+var staticAudioRTPMap = map[int]AudioCodec{
+	0:  {PayloadType: 0, EncodingName: "PCMU", ClockRate: 8000},
+	3:  {PayloadType: 3, EncodingName: "GSM", ClockRate: 8000},
+	8:  {PayloadType: 8, EncodingName: "PCMA", ClockRate: 8000},
+	9:  {PayloadType: 9, EncodingName: "G722", ClockRate: 8000},
+	18: {PayloadType: 18, EncodingName: "G729", ClockRate: 8000},
+}
+
+// selectedAudioCodec extracts the agreed audio codec from a negotiated SDP: the first
+// payload type listed on the first m=audio line, resolved to its encoding name and clock
+// rate. A dynamic payload type takes its name/rate from the matching a=rtpmap; a payload
+// type with no a=rtpmap falls back to the well-known static table (RFC 3551). An unknown
+// static type with no rtpmap yields an empty name and zero clock rate (Label names it
+// "pt<N>"). Pure, no I/O, CRLF-tolerant.
+func selectedAudioCodec(sdp []byte) (AudioCodec, error) {
+	var pt = -1
+	var inAudio bool
+	for _, rawLine := range bytes.Split(sdp, []byte("\n")) {
+		line := strings.TrimRight(string(rawLine), "\r")
+		if strings.HasPrefix(line, "m=") {
+			if inAudio {
+				break // past the first audio block
+			}
+			if !strings.HasPrefix(line, "m=audio ") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				return AudioCodec{}, fmt.Errorf("selectedAudioCodec: malformed m=audio line: %q", line)
+			}
+			n, err := strconv.Atoi(fields[3])
+			if err != nil {
+				return AudioCodec{}, fmt.Errorf("selectedAudioCodec: bad payload type %q: %w", fields[3], err)
+			}
+			pt = n
+			inAudio = true
+			continue
+		}
+		if !inAudio {
+			continue
+		}
+		if strings.HasPrefix(line, "a=rtpmap:") {
+			if c, ok := parseRTPMap(line); ok && c.PayloadType == pt {
+				return c, nil
+			}
+		}
+	}
+	if pt < 0 {
+		return AudioCodec{}, fmt.Errorf("selectedAudioCodec: no audio m= line found")
+	}
+	if c, ok := staticAudioRTPMap[pt]; ok {
+		return c, nil
+	}
+	return AudioCodec{PayloadType: pt}, nil
+}
+
+// parseRTPMap parses one "a=rtpmap:<pt> <encoding>/<clock>[/<channels>]" line into an
+// AudioCodec. ok is false when the line is malformed.
+func parseRTPMap(line string) (AudioCodec, bool) {
+	body := strings.TrimPrefix(line, "a=rtpmap:")
+	fields := strings.Fields(body)
+	if len(fields) < 2 {
+		return AudioCodec{}, false
+	}
+	pt, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return AudioCodec{}, false
+	}
+	parts := strings.Split(fields[1], "/")
+	if len(parts) < 2 {
+		return AudioCodec{}, false
+	}
+	clock, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return AudioCodec{}, false
+	}
+	return AudioCodec{PayloadType: pt, EncodingName: parts[0], ClockRate: clock}, true
+}
+
+// codecsMatch reports whether two negotiated legs agreed on the same audio format,
+// comparing encoding name case-insensitively and clock rate. Payload type numbers may
+// legitimately differ between legs (each side numbers dynamic types independently) and
+// are not compared. Two unknown payload types (empty name) fall back to comparing the
+// payload type number so they are not falsely flagged as a mismatch.
+func codecsMatch(a, b AudioCodec) bool {
+	if a.EncodingName == "" && b.EncodingName == "" {
+		return a.PayloadType == b.PayloadType
+	}
+	return strings.EqualFold(a.EncodingName, b.EncodingName) && a.ClockRate == b.ClockRate
+}
+
 // offerIsWebRTC reports whether an SDP offer is a WebRTC (DTLS-SRTP) offer rather
 // than a plain RTP/AVP offer. A browser offer uses a secure profile (RTP/SAVPF or
 // RTP/SAVP) on its m=audio line and carries a DTLS a=fingerprint; either signal is

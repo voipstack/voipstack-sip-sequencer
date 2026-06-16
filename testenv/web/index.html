@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>jsSIP webphone — sequencer test box</title>
+  <!-- JsSIP vendored locally (provision.sh downloads it). Avoids CDN/MIME issues
+       and works even when the browser reaches the page only through an SSH tunnel. -->
+  <script src="jssip.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 2rem auto; }
+    label { display: block; margin: .4rem 0 .1rem; font-size: .85rem; color: #555; }
+    input { width: 100%; padding: .4rem; box-sizing: border-box; }
+    button { padding: .5rem 1rem; margin-top: .6rem; margin-right: .4rem; }
+    #status { margin: 1rem 0; padding: .6rem; background: #f2f2f2; border-radius: 4px; font-family: monospace; }
+    .row { display: flex; gap: .6rem; }
+    .row > div { flex: 1; }
+  </style>
+</head>
+<body>
+  <h1>jsSIP webphone</h1>
+  <p>Registers through the <strong>sequencer</strong> over WebSocket. Defaults to ext 1005.</p>
+
+  <div class="row">
+    <div><label>WebSocket (sequencer)</label><input id="ws" value="ws://localhost:8080" /></div>
+    <div><label>SIP domain (FreeSWITCH)</label><input id="domain" value="192.168.56.10" /></div>
+  </div>
+  <div class="row">
+    <div><label>Extension</label><input id="ext" value="1005" /></div>
+    <div><label>Password</label><input id="pw" value="voipstacklab" /></div>
+  </div>
+  <button id="register">Register</button>
+  <button id="unregister" disabled>Unregister</button>
+
+  <div id="status">idle</div>
+
+  <label>Call extension</label>
+  <input id="target" value="1001" />
+  <button id="call" disabled>Call</button>
+  <button id="hangup" disabled>Hang up</button>
+  <button id="answer" disabled>Answer</button>
+
+  <audio id="remote" autoplay></audio>
+
+  <script src="phone.js"></script>
+</body>
+</html>

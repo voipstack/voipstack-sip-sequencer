@@ -24,6 +24,7 @@ type PromMetrics struct {
 	appInvocations         *prometheus.CounterVec
 	appFailures            *prometheus.CounterVec
 	terminatingHopFailures prometheus.Counter
+	mediaCodecMismatches   *prometheus.CounterVec
 	sequencingDuration     prometheus.Histogram
 }
 
@@ -44,19 +45,24 @@ func NewPromMetrics() *PromMetrics {
 		Name: "sequencer_terminating_hop_failures_total",
 		Help: "Failed terminating-hop (PBX) attempts.",
 	})
+	mediaCodecMismatches := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "sequencer_media_codec_mismatch_total",
+		Help: "Established calls whose two anchored legs negotiated different audio codecs (no transcoding, so silent audio), by codec pair.",
+	}, []string{"endpoint_codec", "pbx_codec"})
 	sequencingDuration := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "sequencer_sequencing_duration_seconds",
 		Help:    "Per-call setup span from bridge entry to endpoint answer.",
 		Buckets: prometheus.DefBuckets,
 	})
 
-	reg.MustRegister(appInvocations, appFailures, terminatingHopFailures, sequencingDuration)
+	reg.MustRegister(appInvocations, appFailures, terminatingHopFailures, mediaCodecMismatches, sequencingDuration)
 
 	return &PromMetrics{
 		reg:                    reg,
 		appInvocations:         appInvocations,
 		appFailures:            appFailures,
 		terminatingHopFailures: terminatingHopFailures,
+		mediaCodecMismatches:   mediaCodecMismatches,
 		sequencingDuration:     sequencingDuration,
 	}
 }
@@ -66,6 +72,10 @@ func (p *PromMetrics) AppInvocation(name string) { p.appInvocations.WithLabelVal
 func (p *PromMetrics) AppFailure(name string) { p.appFailures.WithLabelValues(name).Inc() }
 
 func (p *PromMetrics) TerminatingHopFailure() { p.terminatingHopFailures.Inc() }
+
+func (p *PromMetrics) MediaCodecMismatch(endpointCodec, pbxCodec string) {
+	p.mediaCodecMismatches.WithLabelValues(endpointCodec, pbxCodec).Inc()
+}
 
 func (p *PromMetrics) ObserveSequencingLatency(d time.Duration) {
 	p.sequencingDuration.Observe(d.Seconds())

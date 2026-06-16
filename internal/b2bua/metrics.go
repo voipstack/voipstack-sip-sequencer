@@ -16,6 +16,10 @@ type MetricsSink interface {
 	TerminatingHopFailure()
 	// ObserveSequencingLatency records the setup span of one established call.
 	ObserveSequencingLatency(d time.Duration)
+	// MediaCodecMismatch counts one established call whose two anchored legs agreed on
+	// different audio codecs — undecodable relayed RTP, since the sequencer never
+	// transcodes — labelled by the endpoint and PBX codec names.
+	MediaCodecMismatch(endpointCodec, pbxCodec string)
 }
 
 type noopMetrics struct{}
@@ -24,3 +28,4 @@ func (noopMetrics) AppInvocation(string)                   {}
 func (noopMetrics) AppFailure(string)                      {}
 func (noopMetrics) TerminatingHopFailure()                 {}
 func (noopMetrics) ObserveSequencingLatency(time.Duration) {}
+func (noopMetrics) MediaCodecMismatch(string, string)      {}

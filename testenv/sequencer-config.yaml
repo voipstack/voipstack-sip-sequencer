@@ -1,0 +1,45 @@
+# sip-sequencer config for the Vagrant test box.
+# Installed to /etc/voipstack-sip-sequencer/config.yaml by provision.sh.
+#
+# sip.listen MUST be the concrete host-only IP, not 0.0.0.0: the engine derives
+# the SDP media host, the RFC 3327 Path host, and the ICE-lite candidate from the
+# host part of this address (see internal/b2bua/engine.go). 0.0.0.0 here would
+# advertise an unroutable address and break RTP, inbound routing, and WebRTC.
+# Port 5070, not 5080: FreeSWITCH's vanilla `external` sofia profile already binds
+# 5080, so the sequencer would fail with "address already in use".
+sip:
+  listen: 192.168.56.10:5070
+
+# WebSocket listener for the jsSIP webphone. 0.0.0.0 so the forwarded
+# localhost:8080 port (see Vagrantfile) reaches it.
+ws:
+  listen: 0.0.0.0:8080
+
+# Downstream PBX = FreeSWITCH on the same host (Docker, host network). Its internal
+# sofia profile binds $${local_ip_v4} = 192.168.56.10 only (not loopback), so the
+# next hop must target that IP, not 127.0.0.1.
+next_hop:
+  uri: sip:192.168.56.10:5060
+  transport: udp
+
+# Anchored RTP pool. Must not overlap FreeSWITCH's range (16384-16484).
+rtp:
+  port_range: 30000-30100
+
+# Advertised in ICE-lite host candidates for the WebRTC (jsSIP) leg. Defaults to
+# the sip.listen host; set explicitly so it is obvious and survives a listen change.
+media:
+  public_address: 192.168.56.10
+
+# One application in the chain: the bundled recording app, tapping audio.
+# App legs always run over TCP, so the recorder listens on TCP :6060.
+sequence:
+  - name: recording
+    uri: sip:rec@127.0.0.1:6060
+    media: tap
+    on_failure: skip
+
+observability:
+  listen: 0.0.0.0:9090
+
+log_level: info

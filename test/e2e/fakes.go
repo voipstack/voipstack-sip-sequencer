@@ -312,6 +312,7 @@ func (f *fakeUAC) invite(ctx context.Context, targetURI string, sdp []byte) (*si
 type fakeNextHop struct {
 	addr    string
 	methods chan sip.RequestMethod
+	reqs    chan *sip.Request
 }
 
 func newFakeNextHop(t *testing.T) *fakeNextHop {
@@ -329,9 +330,14 @@ func newFakeNextHop(t *testing.T) *fakeNextHop {
 		t.Fatalf("fakeNextHop listen: %v", err)
 	}
 
-	f := &fakeNextHop{addr: l.LocalAddr().String(), methods: make(chan sip.RequestMethod, 16)}
+	f := &fakeNextHop{
+		addr:    l.LocalAddr().String(),
+		methods: make(chan sip.RequestMethod, 16),
+		reqs:    make(chan *sip.Request, 16),
+	}
 	srv.OnNoRoute(func(req *sip.Request, tx sip.ServerTransaction) {
 		f.methods <- req.Method
+		f.reqs <- req
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 	})
 
@@ -350,6 +356,19 @@ func (f *fakeNextHop) waitMethod(t *testing.T, timeout time.Duration) sip.Reques
 	case <-time.After(timeout):
 		t.Fatal("fakeNextHop: timeout waiting for a proxied method")
 		return ""
+	}
+}
+
+// waitRequest returns the next request the engine forwarded here, so a test can
+// inspect the on-the-wire headers (e.g. the Via list) the next hop actually saw.
+func (f *fakeNextHop) waitRequest(t *testing.T, timeout time.Duration) *sip.Request {
+	t.Helper()
+	select {
+	case req := <-f.reqs:
+		return req
+	case <-time.After(timeout):
+		t.Fatal("fakeNextHop: timeout waiting for a proxied request")
+		return nil
 	}
 }
 

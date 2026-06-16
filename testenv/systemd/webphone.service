@@ -1,0 +1,20 @@
+[Unit]
+Description=jsSIP webphone static server (test box)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Serves testenv/web on :8090. Reached by the browser via the forwarded
+# host port http://localhost:8090 (localhost = WebRTC secure context).
+ExecStart=/usr/bin/python3 -m http.server 8090 --bind 0.0.0.0 --directory /var/lib/webphone
+Restart=on-failure
+RestartSec=2
+
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
