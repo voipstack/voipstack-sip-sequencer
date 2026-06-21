@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/voipstack/voipstack-sip-sequencer/internal/config"
 )
@@ -865,6 +866,137 @@ sequence: []
 	}
 	if !strings.Contains(err.Error(), "invalid connect_timeout") {
 		t.Errorf("error %q missing expected reason", err.Error())
+	}
+}
+
+func TestLegTimeoutDefaultsTo32sWhenOmitted(t *testing.T) {
+	// Given: a config that omits leg_timeout
+	// When: Parse is called
+	cfg, err := config.Parse([]byte(completeYAML), "test.yaml")
+
+	// Then: the global default resolves to 32s
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.LegTimeoutDur != 32*time.Second {
+		t.Errorf("LegTimeoutDur = %v, want %v", cfg.LegTimeoutDur, 32*time.Second)
+	}
+}
+
+func TestLegTimeoutParsesConfiguredValue(t *testing.T) {
+	// Given: a config with an explicit leg_timeout
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+leg_timeout: "10s"
+sequence: []
+`
+	// When: Parse is called
+	cfg, err := config.Parse([]byte(yaml), "test.yaml")
+
+	// Then: the configured value is resolved
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.LegTimeoutDur != 10*time.Second {
+		t.Errorf("LegTimeoutDur = %v, want %v", cfg.LegTimeoutDur, 10*time.Second)
+	}
+}
+
+func TestAppTimeoutParsesConfiguredValue(t *testing.T) {
+	// Given: an application with an explicit per-app timeout
+	yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+sequence:
+  - name: app1
+    uri: "sip:app1.example.com"
+    timeout: "5s"
+`
+	// When: Parse is called
+	cfg, err := config.Parse([]byte(yaml), "test.yaml")
+
+	// Then: the per-app timeout resolves; absent leg_timeout still defaults to 32s
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Sequence[0].TimeoutDur != 5*time.Second {
+		t.Errorf("TimeoutDur = %v, want %v", cfg.Sequence[0].TimeoutDur, 5*time.Second)
+	}
+	if cfg.LegTimeoutDur != 32*time.Second {
+		t.Errorf("LegTimeoutDur = %v, want %v", cfg.LegTimeoutDur, 32*time.Second)
+	}
+}
+
+func TestAppTimeoutOmittedIsZeroSentinel(t *testing.T) {
+	// Given: an application that omits timeout
+	// When: Parse is called
+	cfg, err := config.Parse([]byte(completeYAML), "test.yaml")
+
+	// Then: TimeoutDur is zero (meaning "use the global default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Sequence[0].TimeoutDur != 0 {
+		t.Errorf("TimeoutDur = %v, want 0", cfg.Sequence[0].TimeoutDur)
+	}
+}
+
+func TestInvalidLegTimeoutRejected(t *testing.T) {
+	// Given: configs whose leg_timeout is unparseable or non-positive
+	for _, bad := range []string{"nope", "0s", "-1s"} {
+		yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+leg_timeout: "` + bad + `"
+sequence: []
+`
+		// When/Then: parse fails naming leg_timeout
+		_, err := config.Parse([]byte(yaml), "test.yaml")
+		if err == nil {
+			t.Fatalf("leg_timeout %q: expected error", bad)
+		}
+		if !strings.Contains(err.Error(), "leg_timeout") {
+			t.Errorf("leg_timeout %q: error %q missing reason", bad, err.Error())
+		}
+	}
+}
+
+func TestInvalidAppTimeoutRejected(t *testing.T) {
+	// Given: configs whose per-app timeout is unparseable or non-positive
+	for _, bad := range []string{"soon", "0s", "-2s"} {
+		yaml := `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+sequence:
+  - name: app1
+    uri: "sip:app1.example.com"
+    timeout: "` + bad + `"
+`
+		// When/Then: parse fails naming timeout
+		_, err := config.Parse([]byte(yaml), "test.yaml")
+		if err == nil {
+			t.Fatalf("timeout %q: expected error", bad)
+		}
+		if !strings.Contains(err.Error(), "timeout") {
+			t.Errorf("timeout %q: error %q missing reason", bad, err.Error())
+		}
 	}
 }
 

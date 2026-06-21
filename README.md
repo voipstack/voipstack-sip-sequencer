@@ -87,12 +87,14 @@ rtp:
 observability:
   listen: 0.0.0.0:9090          # Prometheus /metrics + /health (omit to disable)
 log_level: info                 # debug | info | warn | error (default info)
+leg_timeout: 32s                # global default leg setup/answer timeout (default 32s)
 sequence:                       # ordered application chain — list order IS chain order
   - name: transcribe
     uri: sip:transcriber.internal:5060
     on_failure: skip            # skip | abort
     media: tap                  # tap | none (default none)
     transport: tcp              # udp | tcp | tls (default udp; tls needs tls_profile)
+    timeout: 5s                 # per-app setup deadline (default: leg_timeout)
   - name: record
     uri: sip:recorder.internal:5060
     on_failure: skip
@@ -116,6 +118,7 @@ sequence:                       # ordered application chain — list order IS ch
 | `on_failure` | `abort` — required app; failure fails the call. `skip` — best-effort; on failure log, emit metric, advance. **Default: `skip`.** |
 | `media`      | `tap` — app receives a fork of the call audio (stereo, recvonly). `none` *(default)* — no media (audio `inactive`). |
 | `transport`  | `udp` *(default)* \| `tcp` \| `tls`. `tls` requires a `tls_profile` naming an entry in `tls_profiles`. |
+| `timeout`    | Go duration (e.g. `5s`) bounding this app's leg setup (dial + answer). On expiry the leg fails and `on_failure` applies. **Default: `leg_timeout`.** Must be `> 0` if set. |
 
 **Signaling vs media are orthogonal.** Every app is inserted into the SIP signaling
 chain in order (so it can accept/reject) regardless of `media`; `media` only controls
@@ -128,6 +131,17 @@ whether it also receives the call's audio.
 | `next_hop.uri`       | Required. SIP URI / `host:port` of the terminating hop (PBX).            |
 | `next_hop.transport` | `udp` *(default)* \| `tcp` \| `tls`. `tls` requires a `tls_profile`.     |
 | `next_hop.tls_profile` | Name of a `tls_profiles` entry. Only valid when `transport: tls`.     |
+
+### Timeouts
+
+| Field         | Meaning                                                                 |
+|---------------|-------------------------------------------------------------------------|
+| `leg_timeout` | Go duration (e.g. `32s`) — global default setup/answer timeout for any outbound leg: applications without their own `timeout`, the `next_hop`, mid-call re-INVITEs, and REFER. **Default `32s`** (the SIP INVITE Timer B). Must be `> 0` if set. |
+
+A per-app `timeout` overrides `leg_timeout` for that application's leg only. The bound covers
+both the dial and the answer wait; the dial bound is what fast-fails an unreachable app
+(SIP `CANCEL` can only follow a provisional, so the answer wait alone cannot cut a fully
+silent peer short of Timer B). On expiry the app's `on_failure` decides skip vs abort.
 
 ### TLS configuration
 

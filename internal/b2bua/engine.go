@@ -124,6 +124,13 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 		mediaPublicAddr = host
 	}
 
+	// legTimeout comes from config (Parse defaults it to 32s); guard against a Config built
+	// without Parse (e.g. tests constructing a literal) so a leg deadline is never zero.
+	legTimeout := cfg.LegTimeoutDur
+	if legTimeout <= 0 {
+		legTimeout = 32 * time.Second
+	}
+
 	e := &Engine{
 		cfg:             cfg,
 		ua:              ua,
@@ -134,7 +141,7 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 		calls:           &Registry{m: make(map[string]*Call), byDialog: make(map[string]*Call)},
 		metrics:         noopMetrics{},
 		tlsDialers:      map[string]*sipgo.DialogClientCache{},
-		legTimeout:      32 * time.Second,
+		legTimeout:      legTimeout,
 		ports:           newPortAllocator(portMin, portMax),
 		mediaHost:       host,
 		mediaPublicAddr: mediaPublicAddr,

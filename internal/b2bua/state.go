@@ -2,7 +2,11 @@
 // through external SIP application servers before terminating to a PBX.
 package b2bua
 
-import "github.com/voipstack/voipstack-sip-sequencer/internal/config"
+import (
+	"time"
+
+	"github.com/voipstack/voipstack-sip-sequencer/internal/config"
+)
 
 // CallState tracks the lifecycle of a call.
 type CallState string
@@ -61,4 +65,13 @@ func failureAction(p config.FailurePolicy) failAction {
 		return actionAbort
 	}
 	return actionSkip
+}
+
+// effectiveTimeout is the setup deadline (dial + answer wait) for an application's initial
+// leg: the app's own timeout when configured, otherwise the global default.
+func effectiveTimeout(app config.Application, global time.Duration) time.Duration {
+	if app.TimeoutDur > 0 {
+		return app.TimeoutDur
+	}
+	return global
 }
