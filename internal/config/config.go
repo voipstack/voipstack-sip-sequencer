@@ -144,6 +144,9 @@ type Observability struct {
 }
 
 // Application describes a single external SIP application in the sequence chain.
+// Timeout is the optional per-app setup deadline (dial + answer wait) as a Go duration
+// string; an empty value falls back to the global LegTimeout. TimeoutDur is the resolved
+// value (zero means "use the global default").
 type Application struct {
 	Name       string              `yaml:"name"`
 	URI        string              `yaml:"uri"`
@@ -151,6 +154,8 @@ type Application struct {
 	Media      MediaMode           `yaml:"media"`
 	Transport  Transport           `yaml:"transport"`
 	TLSProfile string              `yaml:"tls_profile"`
+	Timeout    string              `yaml:"timeout"`
+	TimeoutDur time.Duration       `yaml:"-"`
 	Resolved   *ResolvedTLSProfile `yaml:"-"`
 }
 
@@ -164,6 +169,9 @@ type NextHop struct {
 }
 
 // Config is the validated, in-memory representation of the operator-supplied YAML file.
+// LegTimeout is the global default answer/setup timeout for any outbound leg (apps without
+// their own timeout, the next hop, mid-call re-INVITE, and REFER) as a Go duration string;
+// an empty value defaults to 32s. LegTimeoutDur is the resolved, always-positive value.
 type Config struct {
 	SIP           SIP                   `yaml:"sip"`
 	TLS           TLS                   `yaml:"tls"`
@@ -176,6 +184,8 @@ type Config struct {
 	TLSProfiles   map[string]TLSProfile `yaml:"tls_profiles"`
 	LogLevel      LogLevel              `yaml:"log_level"`
 	Observability Observability         `yaml:"observability"`
+	LegTimeout    string                `yaml:"leg_timeout"`
+	LegTimeoutDur time.Duration         `yaml:"-"`
 }
 
 // rawConfig mirrors Config but tracks presence of the sequence and next_hop keys via pointers.
@@ -191,6 +201,7 @@ type rawConfig struct {
 	TLSProfiles   map[string]TLSProfile `yaml:"tls_profiles"`
 	LogLevel      LogLevel              `yaml:"log_level"`
 	Observability Observability         `yaml:"observability"`
+	LegTimeout    string                `yaml:"leg_timeout"`
 }
 
 // Parse decodes YAML bytes into a validated Config. source is used only in error messages.
@@ -213,6 +224,7 @@ func Parse(data []byte, source string) (Config, error) {
 		TLSProfiles:   raw.TLSProfiles,
 		LogLevel:      raw.LogLevel,
 		Observability: raw.Observability,
+		LegTimeout:    raw.LegTimeout,
 	}
 	nextHopPresent := raw.NextHop != nil
 	if nextHopPresent {
@@ -226,6 +238,9 @@ func Parse(data []byte, source string) (Config, error) {
 	applyDefaults(&cfg)
 
 	if err := validate(cfg, sequencePresent, nextHopPresent); err != nil {
+		return Config{}, fmt.Errorf("parse config %q: %w", source, err)
+	}
+	if err := resolveTimeouts(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config %q: %w", source, err)
 	}
 	if err := resolveTLS(&cfg); err != nil {
@@ -423,6 +438,43 @@ func validateTLSProfiles(c Config) error {
 		if p.VerifyDepth != nil && *p.VerifyDepth < 0 {
 			return fmt.Errorf("tls_profiles[%q]: verify_depth must be >= 0", name)
 		}
+	}
+	return nil
+}
+
+// defaultLegTimeout is the global answer/setup timeout applied when leg_timeout is omitted.
+// It matches the SIP INVITE client transaction Timer B (64*T1).
+const defaultLegTimeout = 32 * time.Second
+
+// resolveTimeouts parses the global leg_timeout and each app's timeout into time.Duration,
+// defaulting the global to defaultLegTimeout when omitted and leaving an omitted per-app
+// timeout at zero (the "use the global default" sentinel). A present value must parse as a
+// Go duration and be strictly positive.
+func resolveTimeouts(cfg *Config) error {
+	cfg.LegTimeoutDur = defaultLegTimeout
+	if cfg.LegTimeout != "" {
+		d, err := time.ParseDuration(cfg.LegTimeout)
+		if err != nil {
+			return fmt.Errorf("invalid leg_timeout %q: %w", cfg.LegTimeout, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("leg_timeout %q: must be > 0", cfg.LegTimeout)
+		}
+		cfg.LegTimeoutDur = d
+	}
+	for i := range cfg.Sequence {
+		app := &cfg.Sequence[i]
+		if app.Timeout == "" {
+			continue
+		}
+		d, err := time.ParseDuration(app.Timeout)
+		if err != nil {
+			return fmt.Errorf("sequence[%d] %q: invalid timeout %q: %w", i, app.Name, app.Timeout, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("sequence[%d] %q: timeout %q must be > 0", i, app.Name, app.Timeout)
+		}
+		app.TimeoutDur = d
 	}
 	return nil
 }

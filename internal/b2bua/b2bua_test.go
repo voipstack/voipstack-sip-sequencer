@@ -509,6 +509,55 @@ func TestAppTimeoutReturns503(t *testing.T) {
 	}
 }
 
+// Given an app with its own timeout; When effectiveTimeout is asked; Then the app value wins.
+func TestEffectiveTimeoutPrefersAppOverGlobal(t *testing.T) {
+	app := config.Application{Name: "a", TimeoutDur: 2 * time.Second}
+	if got := effectiveTimeout(app, 32*time.Second); got != 2*time.Second {
+		t.Fatalf("effectiveTimeout = %v, want %v", got, 2*time.Second)
+	}
+}
+
+// Given an app with no timeout; When effectiveTimeout is asked; Then the global default wins.
+func TestEffectiveTimeoutFallsBackToGlobal(t *testing.T) {
+	app := config.Application{Name: "a"}
+	if got := effectiveTimeout(app, 32*time.Second); got != 32*time.Second {
+		t.Fatalf("effectiveTimeout = %v, want %v", got, 32*time.Second)
+	}
+}
+
+// Given an unreachable app with a short per-app timeout and on_failure: skip and a global
+// legTimeout far larger; When the call arrives; Then the dead app is skipped within ~timeout
+// (not the global) and the call still completes via the PBX.
+func TestPerAppTimeoutFailsFastAndSkips(t *testing.T) {
+	pbx := newFakeUAS(t)
+	caller := newFakeUAC(t)
+
+	deadAddr := freeAddr(t) // nothing listens here → dial fails / no answer
+	listenAddr := freeAddr(t)
+	// Global legTimeout is large; only the per-app timeout makes this fast.
+	startEngine(t, multiAppConfig(listenAddr, pbx.sipURI(), []config.Application{
+		{Name: "dead", URI: "sip:" + deadAddr, OnFailure: config.FailureSkip, TimeoutDur: 300 * time.Millisecond},
+	}), 30*time.Second)
+	ctx := context.Background()
+
+	go func() {
+		dss := pbx.waitInvite(t, 3*time.Second)
+		_ = dss.Respond(200, "OK", []byte(testSDP))
+	}()
+
+	start := time.Now()
+	sess, err := caller.invite(ctx, "sip:"+listenAddr, []byte(testSDP))
+	if err != nil {
+		t.Fatalf("caller invite: %v", err)
+	}
+	if err := sess.WaitAnswer(context.Background(), sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("expected call to complete via PBX, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("call took %v; per-app timeout did not fast-fail (global=30s)", elapsed)
+	}
+}
+
 // Given a call; When bridged; Then inbound Call-ID differs from both outbound Call-IDs (AC5).
 func TestInboundAndOutboundAreDistinctDialogs(t *testing.T) {
 	app := newFakeUAS(t)

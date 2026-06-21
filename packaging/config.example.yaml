@@ -20,6 +20,9 @@ sequence:
     uri: sip:asr@127.0.0.1:6060  # the application server's SIP URI (reached over TCP)
     media: tap                # tap = fork both directions to the app; none = inactive audio
     on_failure: skip          # skip = continue the chain on failure; abort = drop the call
+    timeout: 5s               # optional per-app setup deadline (dial + answer); on expiry on_failure applies. Omit to use leg_timeout
+
+leg_timeout: 32s              # global default leg answer/setup timeout (apps without timeout, next hop, mid-call, REFER); omit for 32s
 
 observability:
   listen: 0.0.0.0:9090        # optional /health + /metrics HTTP listener; empty/omit to disable

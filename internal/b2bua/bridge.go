@@ -272,6 +272,20 @@ func (e *Engine) acquireTap() (tapResources, error) {
 	}, nil
 }
 
+// appLegFailed performs the bookkeeping shared by every app-leg failure (originate or
+// answer): it releases a pending tap, emits the failure metric, and logs the failure with
+// its stage. It returns true when the app's policy requires aborting the call — the caller
+// then sends the stage-specific final response and returns — and false to skip to the next
+// application.
+func (e *Engine) appLegFailed(app config.Application, stage string, hasTap bool, tap tapResources, err error) bool {
+	if hasTap {
+		tap.release(e.ports)
+	}
+	e.metrics.AppFailure(app.Name)
+	slog.Warn("application failed", "name", app.Name, "uri", app.URI, "policy", app.OnFailure, "stage", stage, "err", err)
+	return failureAction(app.OnFailure) == actionAbort
+}
+
 // runAppChain originates one leg per configured application in sequence, applying
 // each app's media mode and on-failure policy. It returns false when an app's
 // failure policy aborts the call (final response already sent, call torn down).
@@ -323,9 +337,15 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 			}
 		}
 
+		// A single deadline bounds this app's whole setup span (dial + answer wait). The
+		// dial bound is what fast-fails an unreachable/silent plain-TCP app — sipgo can only
+		// CANCEL after a provisional (RFC 3261 §9.1), so the answer-wait portion alone cannot
+		// cut a silent peer short of Timer B. A per-app timeout overrides the global default.
+		appCtx, appCancel := context.WithTimeout(ctx, effectiveTimeout(app, e.legTimeout))
+
 		// A plain application leg always runs over TCP (the tap-mode offer can exceed
 		// sipgo's UDP MTU guard); a tls app dials over its profile's per-profile dialer.
-		cache, appURI, dialCtx, dialCancel := e.dialerFor(ctx, appURI, app.Transport, app.TLSProfile, app.Resolved, "tcp")
+		cache, appURI, dialCtx, dialCancel := e.dialerFor(appCtx, appURI, app.Transport, app.TLSProfile, app.Resolved, "tcp")
 
 		appLegID := newLegID()
 		appHeaders := append(call.forwardHeaders(),
@@ -334,29 +354,19 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 		appSess, err := cache.Invite(dialCtx, appURI, inviteBody, appHeaders...)
 		dialCancel()
 		if err != nil {
-			if hasTap {
-				tap.release(e.ports)
-			}
-			e.metrics.AppFailure(app.Name)
-			slog.Warn("application failed", "name", app.Name, "uri", app.URI, "policy", app.OnFailure, "stage", "originate", "err", err)
-			if failureAction(app.OnFailure) == actionAbort {
+			appCancel()
+			if e.appLegFailed(app, "originate", hasTap, tap, err) {
 				e.fail(call, 503, "Service Unavailable", fmt.Sprintf("app leg originate failed: %v", err))
 				return false
 			}
 			continue
 		}
 
-		legCtx, legCancel := context.WithTimeout(ctx, e.legTimeout)
-		appErr := appSess.WaitAnswer(legCtx, call.relayProvisional())
-		legCancel()
+		appErr := appSess.WaitAnswer(appCtx, call.relayProvisional())
+		appCancel()
 
 		if appErr != nil {
-			if hasTap {
-				tap.release(e.ports)
-			}
-			e.metrics.AppFailure(app.Name)
-			slog.Warn("application failed", "name", app.Name, "uri", app.URI, "policy", app.OnFailure, "stage", "answer", "err", appErr)
-			if failureAction(app.OnFailure) == actionAbort {
+			if e.appLegFailed(app, "answer", hasTap, tap, appErr) {
 				e.respondInboundFromLegError(call, appErr, fmt.Sprintf("app leg %q failed: %v", app.URI, appErr))
 				return false
 			}
