@@ -8,8 +8,11 @@ server-side (inbound) and one client-side (outbound) — that enforces the confi
 verification policy: minimum TLS version, TLS 1.2 cipher allowlist, mutual-TLS peer
 verification, allowed-subject pinning, certificate-chain depth cap, and optional date-check
 relaxation. Rules without a native `tls.Config` field (subjects, depth, date relaxation) are
-enforced in a verification callback. Secure-by-default: omitted policy yields a safe context
-(TLS 1.2 floor, Go default ciphers, dates checked); weak versions/ciphers are rejected.
+enforced in a verification callback. Posture: the TLS 1.2 floor and cipher allowlist always apply
+and weak versions/ciphers are always rejected, but **peer-certificate verification is opt-in via
+`verify_peer`**. An inbound listener requires no client cert by default; an **outbound leg is
+encrypt-only by default — it accepts any server certificate** and validates the remote (chain,
+dates, hostname, subjects, depth) only when `verify_peer` is set.
 
 Boundary: build TLS contexts only. Opening listeners (015) and dialing (016) consume the
 produced `*tls.Config`; this story does not bind sockets or handshake on the wire (verification
@@ -55,7 +58,8 @@ class ResolvedTLSProfile {
 Provider <|.. StdProvider : implements
 StdProvider --> Material : Load (cached)
 StdProvider --> ResolvedTLSProfile : reads policy
-StdProvider ..> verifier : installs VerifyPeerCertificate
+StdProvider ..> verifier : installs VerifyPeerCertificate (strict)
+StdProvider ..> connVerifier : installs VerifyConnection (relaxed dates)
 ```
 
 Notes:
@@ -84,28 +88,40 @@ Notes:
 
 3. **Server verification (`ServerConfig`):**
    - `rp.VerifyPeer == false` → `ClientAuth = NoClientCert`; no callback (AC1: one-way handshake).
-   - `rp.VerifyPeer == true` → `ClientAuth = RequireAndVerifyClientCert`, `ClientCAs = Material.TrustPool`,
-     and `VerifyPeerCertificate = verifier(roots=TrustPool, depth=rp.VerifyDepth, subjects=rp.VerifySubjects,
-     checkDates=rp.VerifyDates, keyUsage=ExtKeyUsageClientAuth)` (AC2, AC3, AC4, AC7).
+   - `rp.VerifyPeer == true` + `verify_dates == true` → `ClientAuth = RequireAndVerifyClientCert`,
+     `ClientCAs = Material.TrustPool`, `VerifyPeerCertificate = verifier(rp.VerifyDepth, rp.VerifySubjects)`
+     (Go validates the client chain + dates + key usage; the callback adds depth/subject) (AC2, AC3, AC4, AC7).
+   - `rp.VerifyPeer == true` + `verify_dates == false` → `ClientAuth = RequireAnyClientCert` (Go's
+     RequireAndVerify always enforces dates and `InsecureSkipVerify` is client-only, so require a cert
+     but verify it ourselves), `VerifyConnection = connVerifier(TrustPool, rp.VerifyDepth, rp.VerifySubjects,
+     ExtKeyUsageClientAuth, checkHostname=false)` — a client certificate has no hostname to match (AC7).
 
 4. **Client verification (`ClientConfig`):**
-   - The client **always** validates the remote server cert against `RootCAs = Material.TrustPool`
-     (nil → system roots) (AC8). `verify_peer` is a server-only concept and does not relax this.
-   - Install `VerifyPeerCertificate = verifier(roots=RootCAs, depth, subjects, checkDates=rp.VerifyDates,
-     keyUsage=ExtKeyUsageServerAuth)` to add depth/subject (and, when relaxed, date-free) checks.
+   - **Relaxed by default (`verify_peer == false`):** the outbound leg is encrypt-only — set
+     `InsecureSkipVerify = true` and install no verification callback. Any server certificate is
+     accepted (self-signed, expired, hostname mismatch, untrusted CA). Strict validation is opt-in.
+   - **`verify_peer == true` + `verify_dates == true`:** leave `InsecureSkipVerify = false` so Go
+     performs its standard chain + date + **hostname** (`ServerName`) + key-usage verification against
+     `RootCAs = Material.TrustPool` (nil → system roots); install `VerifyPeerCertificate =
+     verifier(depth, subjects)` to add the depth cap and subject allowlist.
+   - **`verify_peer == true` + `verify_dates == false`:** set `InsecureSkipVerify = true` and install
+     `VerifyConnection = connVerifier(RootCAs, depth, subjects, ExtKeyUsageServerAuth, checkHostname=true)`
+     — it re-validates the full chain (incl. key usage) with the date window relaxed but **still
+     enforces the peer hostname** from `cs.ServerName`. Relaxing dates never relaxes identity.
 
-5. **The `verifier` factory (the security-sensitive core):**
-   - **Strict (`checkDates == true`, default):** leave `InsecureSkipVerify = false` so Go performs
-     its standard chain + date + key-usage verification and passes `verifiedChains`. The callback
-     only **adds** two checks on the accepted chain: depth cap and subject allowlist. Go's vetted
-     verification is never bypassed.
-   - **Relaxed (`checkDates == false`):** set `InsecureSkipVerify = true` (Go skips all checks, so
-     the callback receives `verifiedChains == nil`) and **rebuild** the chain in the callback:
-     parse `rawCerts` → leaf + intermediates, `x509.Verify(VerifyOptions{Roots, Intermediates,
-     KeyUsages:[ku], CurrentTime: leaf.NotBefore})`. `CurrentTime = leaf.NotBefore` neutralizes the
-     date window (always inside `[NotBefore, NotAfter]`) while keeping full chain validation; then
-     apply depth + subject checks. This is the only path that skips dates, and it still validates
-     the chain against the configured roots.
+5. **Verification callbacks (the security-sensitive core):**
+   - **`verifier` (strict, `VerifyPeerCertificate`):** used when validation is on and dates are
+     checked. Go has already done full chain + date + key-usage (+ client-side hostname) verification
+     and passes `verifiedChains`; the callback only **adds** the depth cap and subject allowlist via
+     the shared `checkChains` helper. Go's vetted verification is never bypassed.
+   - **`connVerifier` (relaxed dates, `VerifyConnection`):** used when validation is on but
+     `verify_dates:false`. Go's built-in verification is off (`InsecureSkipVerify` on the client /
+     `RequireAnyClientCert` on the server), so it rebuilds the chain from the presented certs:
+     `leaf.Verify(VerifyOptions{Roots, Intermediates, KeyUsages:[ku], CurrentTime: leaf.NotBefore,
+     DNSName: cs.ServerName when checkHostname})`. `CurrentTime = leaf.NotBefore` neutralizes only the
+     date window while keeping chain + key-usage + (client) hostname checks; then `checkChains` applies
+     depth + subject. `VerifyConnection` (not `VerifyPeerCertificate`) is required because only it
+     carries the negotiated `ServerName`.
 
 6. **Pure helpers** (`mapVersion`, `mapCiphers`, `checkDepth`, `checkSubject`) are pure functions,
    unit-tested directly (AGENTS.md). No GlobalExceptionHandler / no layering — errors are values.
@@ -115,15 +131,18 @@ Notes:
 ### Type/Interface Relationships
 1. `Provider` gains `ServerConfig`/`ClientConfig`; `StdProvider` implements them. `Material`,
    `NewStdProvider` unchanged.
-2. `verifier(...) func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error` is an
-   unexported factory returning a `tls.Config.VerifyPeerCertificate` callback.
+2. `verifier(maxIntermediates int, subjects []string) func([][]byte, [][]*x509.Certificate) error`
+   returns the strict `VerifyPeerCertificate` callback; `connVerifier(roots, maxIntermediates,
+   subjects, ku, checkHostname bool) func(tls.ConnectionState) error` returns the relaxed-dates
+   `VerifyConnection` callback. Both delegate depth + subject to the shared `checkChains` helper.
 3. `mapVersion`, `mapCiphers`, `checkDepth`, `checkSubject` are unexported pure helpers.
 4. No new package; all in `internal/tlsprov`. Still the only importer of `crypto/tls`/`crypto/x509`.
 
 ### Dependencies
 1. `StdProvider.ServerConfig`/`ClientConfig` → `Load` (cache) → build `*tls.Config` → `cfgCache`.
-2. `verifier` callback → `x509.Verify` (relaxed) or reads `verifiedChains` (strict) → `checkDepth`,
-   `checkSubject`.
+2. `verifier` (strict) reads `verifiedChains`; `connVerifier` (relaxed) calls `leaf.Verify` to
+   rebuild; both → `checkChains` → `checkDepth`, `checkSubject`. `ServerConfig`/`ClientConfig` share
+   `cached` (cache get/build/store) and `loadAndBase` (cert + version-floor + cipher base config).
 3. `mapCiphers` reads `tls.CipherSuites()` to build the name→id allowlist for TLS 1.2.
 4. Consumers (b2bua listener/dialer, 015/016) call these via the stored `tlsprov.Provider`.
 
@@ -158,22 +177,20 @@ Notes:
    if `leaf.Subject.String()` is in `allow` return nil; else error `"peer subject %q not in verify_subjects"`.
    Exact string match on the leaf subject (SAN matching is out of scope).
 
-### Implement `verifier` factory — `internal/tlsprov/verify.go`
-1. `func verifier(roots *x509.CertPool, maxIntermediates int, subjects []string, checkDates bool,
-   ku x509.ExtKeyUsage) func([][]byte, [][]*x509.Certificate) error`.
-2. Returned callback logic:
-   - **Strict (`checkDates == true`):** for each chain in `verifiedChains`, if
-     `checkDepth(chain, maxIntermediates)==nil && checkSubject(chain[0], subjects)==nil` → return nil.
-     If none pass → return the first failing check's error. (Go already validated chain + dates.)
-   - **Relaxed (`checkDates == false`):** parse `rawCerts` into `[]*x509.Certificate` (`x509.ParseCertificate`);
-     leaf = certs[0]; intermediates pool = certs[1:]. `chains, err := leaf.Verify(x509.VerifyOptions{
-     Roots: roots, Intermediates: interPool, KeyUsages: []x509.ExtKeyUsage{ku}, CurrentTime: leaf.NotBefore})`;
-     on err → return wrapped chain error. Then for each returned chain apply `checkDepth` + `checkSubject`
-     as above.
-3. Constraints: never log certificate bytes; the callback returns errors only (handshake aborts).
-   `roots == nil` in relaxed mode → use system roots via `x509.SystemCertPool()` (client) or fail
-   for server mTLS (a server requiring peer verification with no trust pool is a config error —
-   surface it when building `ServerConfig`).
+### Implement verification callbacks — `internal/tlsprov/verify.go`
+1. `func verifier(maxIntermediates int, subjects []string) func([][]byte, [][]*x509.Certificate) error`
+   — strict `VerifyPeerCertificate`: Go has already validated chain + dates + key usage (+ client
+   hostname); the callback just returns `checkChains(verifiedChains, maxIntermediates, subjects)`.
+2. `func connVerifier(roots *x509.CertPool, maxIntermediates int, subjects []string,
+   ku x509.ExtKeyUsage, checkHostname bool) func(tls.ConnectionState) error` — relaxed-dates
+   `VerifyConnection`: parse `cs.PeerCertificates` → leaf + intermediates; `roots == nil` →
+   `x509.SystemCertPool()`; `leaf.Verify(VerifyOptions{Roots, Intermediates, KeyUsages:[ku],
+   CurrentTime: leaf.NotBefore, DNSName: cs.ServerName when checkHostname})`; on err → wrapped chain
+   error; then `checkChains(built, ...)`.
+3. `func checkChains(chains [][]*x509.Certificate, maxIntermediates int, subjects []string) error`
+   — shared: accept if any chain passes both `checkDepth` and `checkSubject`; else the first failure
+   (or "no verified certificate chain").
+4. Constraints: never log certificate bytes; callbacks return errors only (handshake aborts).
 
 ### Implement `ServerConfig` — `internal/tlsprov/context.go`
 1. `func (p *StdProvider) ServerConfig(rp config.ResolvedTLSProfile) (*tls.Config, error)`.
@@ -184,12 +201,15 @@ Notes:
    - Base: `&tls.Config{Certificates: []tls.Certificate{m.Certificate}, MinVersion: min,
      MaxVersion: tls.VersionTLS13, CipherSuites: suites}`.
    - If `rp.VerifyPeer`: require `m.TrustPool != nil` else error
-     `"tls_profiles[%q]: verify_peer requires a ca bundle"`; set `ClientCAs = m.TrustPool`,
-     `ClientAuth = tls.RequireAndVerifyClientCert`; if `!rp.VerifyDates` also set
-     `InsecureSkipVerify = true`; set `VerifyPeerCertificate = verifier(m.TrustPool, rp.VerifyDepth,
-     rp.VerifySubjects, rp.VerifyDates, x509.ExtKeyUsageClientAuth)`.
+     `"tls_profiles[%q]: verify_peer requires a ca bundle"`; set `ClientCAs = m.TrustPool`. Then:
+     - `verify_dates` true → `ClientAuth = tls.RequireAndVerifyClientCert`,
+       `VerifyPeerCertificate = verifier(rp.VerifyDepth, rp.VerifySubjects)`.
+     - `verify_dates` false → `ClientAuth = tls.RequireAnyClientCert` (Go's RequireAndVerify always
+       enforces dates and `InsecureSkipVerify` is client-only, so require a cert but verify it
+       ourselves), `VerifyConnection = connVerifier(m.TrustPool, rp.VerifyDepth, rp.VerifySubjects,
+       x509.ExtKeyUsageClientAuth, false)` (a client cert has no hostname to match).
    - Else: `ClientAuth = tls.NoClientCert` (no callback).
-   - Cache and return.
+   - Cache and return. (The cache get/store is `cached`; the base config is `loadAndBase`.)
 
 ### Implement `ClientConfig` — `internal/tlsprov/context.go`
 1. `func (p *StdProvider) ClientConfig(rp config.ResolvedTLSProfile) (*tls.Config, error)`.
@@ -199,10 +219,15 @@ Notes:
    - Base: `&tls.Config{Certificates: []tls.Certificate{m.Certificate}, MinVersion: min,
      MaxVersion: tls.VersionTLS13, CipherSuites: suites, RootCAs: m.TrustPool}` (nil RootCAs → Go
      uses system roots).
-   - If `!rp.VerifyDates` set `InsecureSkipVerify = true`. Always set `VerifyPeerCertificate =
-     verifier(m.TrustPool, rp.VerifyDepth, rp.VerifySubjects, rp.VerifyDates, x509.ExtKeyUsageServerAuth)`
-     so depth/subject (and date relaxation) are enforced on the remote chain.
-   - Cache and return.
+   - Switch on policy:
+     - `!rp.VerifyPeer` (default) → `InsecureSkipVerify = true`, no callback: encrypt-only, accept
+       any server cert.
+     - `rp.VerifyDates` → `VerifyPeerCertificate = verifier(rp.VerifyDepth, rp.VerifySubjects)`
+       (Go validates chain + dates + hostname; callback adds depth/subject).
+     - else → `InsecureSkipVerify = true` + `VerifyConnection = connVerifier(m.TrustPool,
+       rp.VerifyDepth, rp.VerifySubjects, x509.ExtKeyUsageServerAuth, true)` (relax dates, keep chain
+       + key usage + hostname).
+   - Cache and return. (Shared `cached` + `loadAndBase` as in `ServerConfig`.)
 
 ### Add tests — `internal/tlsprov/context_test.go`
 1. BDD, real certs in `t.TempDir()`: a test CA mints a leaf (and an intermediate for chain-depth
@@ -222,7 +247,15 @@ Notes:
      handshake ignores the allowlist (Go fixed suites). Unknown cipher name → `ClientConfig`/`ServerConfig` error.
    - `TestVerifyDatesToggle` (AC7): expired remote rejected with `verify_dates:true`, accepted with
      `verify_dates:false`; assert chain still validated (untrusted-CA expired cert still rejected under false).
-   - `TestClientValidatesAgainstCA` (AC8): remote signed by a CA not in the bundle rejected; in-bundle accepted.
+   - `TestClientValidatesAgainstCA` (AC8): with `verify_peer:true`, remote signed by a CA not in the
+     bundle rejected; in-bundle accepted. (Client validation tests now set `verify_peer:true`, since
+     validation is opt-in.)
+   - `TestRelaxedDefaultAcceptsAnyServerCert`: `verify_peer:false` (default) accepts a self-signed,
+     expired, wrong-hostname server cert (encrypt-only).
+   - `TestVerifyDatesFalseStillChecksHostname`: `verify_peer:true` + `verify_dates:false` rejects a
+     wrong-hostname cert (MITM guard) yet accepts an expired right-hostname cert.
+   - `TestServerVerifyDatesFalseAcceptsExpiredClientCert`: inbound `verify_peer:true` +
+     `verify_dates:false` accepts an expired CA-trusted client cert, still rejects an untrusted-CA one.
    - Negatives: `TestVerifyPeerWithoutCABundleErrors`; `TestUnknownCipherErrors`; `TestUnsupportedMinVersionErrors`.
 
 ## Norms
@@ -231,9 +264,12 @@ Notes:
    naming the profile (`rp.Name`); never log certificate/key bytes.
 2. **Boundary:** only `internal/tlsprov` imports `crypto/tls`/`crypto/x509`. The `Provider`
    interface exposes `*tls.Config` deliberately (sipgo requires it); no other library leaks.
-3. **Secure default is the untouched path:** when `verify_dates` is true, Go's native verification
-   runs unmodified and the callback only *adds* checks. `InsecureSkipVerify` is set **only** when
-   `verify_dates:false`, always paired with a custom chain-rebuilding verifier — never bare.
+3. **Relaxed-by-default, strict-on-demand:** `verify_peer:false` (default) is encrypt-only on the
+   outbound leg — `InsecureSkipVerify = true` with no callback (a deliberate posture, not an
+   oversight). When `verify_peer:true` + `verify_dates:true`, Go's native verification runs unmodified
+   and `verifier` only *adds* checks. `InsecureSkipVerify` is otherwise paired with a chain-rebuilding
+   `connVerifier` (relaxed dates) that re-validates chain, key usage, and (client) hostname — never
+   bare except in the explicit encrypt-only default.
 4. **Pure helpers:** `mapVersion`/`mapCiphers`/`checkDepth`/`checkSubject` are pure and table-tested.
 5. **Build once:** contexts cached per `role+profile` (pairs with the cert cache); read-only after build.
 6. **Tests (BDD, real fakes):** real generated certs; in-process handshakes; one behavior per test;
@@ -243,8 +279,10 @@ Notes:
 
 ## Safeguards
 
-1. **Secure default:** a profile with all policy omitted yields TLS 1.2 floor, Go default ciphers,
-   dates checked, no client-cert demand — security never depends on the operator setting fields (AC1, NFR).
+1. **Default posture (operator-owned):** a profile with all policy omitted yields a TLS 1.2 floor and
+   the cipher allowlist, and **no peer-certificate verification** — an inbound listener demands no
+   client cert and an outbound leg is encrypt-only (accepts any server cert). This is a deliberate,
+   documented choice; strict peer validation is opt-in via `verify_peer:true` (AC1, AC2).
 2. **mTLS:** `verify_peer:true` requires and verifies the client certificate against the trust pool;
    a missing trust pool is a build-time error, not a silent accept (AC2).
 3. **Subject pinning:** with a non-empty `verify_subjects`, only a leaf whose exact subject string is
@@ -253,8 +291,9 @@ Notes:
 5. **Version floor:** handshakes below `min_version` are rejected; `MaxVersion` pinned to TLS 1.3 (AC5).
 6. **Cipher control:** the `ciphers` allowlist applies to TLS 1.2 only and is ignored on TLS 1.3;
    unknown / non-1.2 names fail context construction with a naming error (AC6).
-7. **Date relaxation is bounded:** `verify_dates:false` skips only the date window; chain validation
-   against the configured roots, depth, and subjects still applies (AC7). Default path is Go-native.
+7. **Date relaxation is bounded:** under `verify_peer:true`, `verify_dates:false` relaxes only the
+   date window — chain validation against the configured roots, key usage, depth, subjects, and (on
+   the client) the peer **hostname** still apply (AC7). Relaxing dates never relaxes identity.
 8. **Client CA validation:** the client rejects a remote whose chain does not terminate in the
    configured CA bundle (or system roots when none configured) (AC8).
 9. **No secret leakage:** no certificate/key material in errors or logs; verification failures abort

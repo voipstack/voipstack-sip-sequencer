@@ -161,7 +161,7 @@ All fields below live on a `tls_profile`. Endpoints inherit them by name.
 
 **Validation**
 
-- **verify_peer** — require and verify the peer certificate (mTLS). Default `false`. Meaningful on the inbound listener.
+- **verify_peer** — require/validate the peer certificate. Default `false`. The opt-in for peer validation on **both** directions: mutual TLS on the inbound listener, and full chain + dates + hostname validation of the remote on an outbound leg. When `false` (default), the inbound listener requires no client cert and an **outbound leg is encrypt-only — it accepts any server certificate**.
 - **verify_depth** — maximum certificate chain depth. Default `2`. Enforced during certificate verification (no built-in toggle; handled in validation logic).
 - **verify_dates** — check Not Before / Not After. Default `true` (always checked unless explicitly disabled). Disabling requires a custom verification path.
 - **verify_subjects** — allowlist of certificate subjects (mTLS pinning). Default empty (any subject). Checked against the peer certificate's subject during verification.

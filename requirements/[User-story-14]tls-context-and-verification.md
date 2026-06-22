@@ -52,8 +52,9 @@ Key points:
   cert), `verify_subjects` (allowed leaf subjects), `verify_depth` (max chain length),
   and `verify_dates`.
 - Build a **client-side** TLS context from a resolved outbound profile: certificate (for
-  mTLS), `min_version`, `ciphers`, and validation of the remote's chain and dates against
-  the configured CA, honouring `verify_depth` / `verify_dates`.
+  mTLS), `min_version`, `ciphers`. Remote-server validation (chain, dates, hostname, against the
+  configured CA, honouring `verify_depth` / `verify_dates`) is **opt-in via `verify_peer`**; the
+  default outbound context is encrypt-only and accepts any server certificate.
 - Enforce the non-standard-library rules (`verify_depth`, `verify_subjects`, `verify_dates
   = false`) inside the peer-verification callback.
 - Reject weak TLS versions (below the configured floor) and apply the cipher allowlist by
@@ -106,18 +107,19 @@ valid certificate is accepted.
 rejected), while the TLS 1.3 handshake proceeds using Go's fixed 1.3 suites regardless of
 the allowlist.
 
-#### AC7: `verify_dates` controls expiry checking
-**Given** a client context validating a remote whose certificate is expired
+#### AC7: `verify_dates` controls expiry checking (when validation is on)
+**Given** a client context with `verify_peer: true` validating a remote whose certificate is expired
 **When** the profile has `verify_dates: true` (default) **and** when it has `verify_dates: false`
-**Then** the expired certificate is rejected under `true` and accepted under `false`
-(the relaxation intended for dev/testing).
+**Then** the expired certificate is rejected under `true` and accepted under `false`, while the
+chain, key usage, and **hostname** are still verified under `false` (relaxing dates never relaxes identity).
 
-#### AC8: Client context validates the remote against the configured CA
-**Given** a client context whose configured CA bundle does not include the CA that signed
-the remote's certificate
+#### AC8: Client context validates the remote against the configured CA (under `verify_peer`)
+**Given** a client context with `verify_peer: true` whose configured CA bundle does not include
+the CA that signed the remote's certificate
 **When** the outbound handshake occurs
 **Then** verification fails and the connection is rejected; a remote signed by a CA in the
-bundle is accepted.
+bundle is accepted. (With `verify_peer: false` — the default — the outbound leg is encrypt-only
+and accepts any server certificate.)
 
 #### Non-Functional Expectations
 - Omitting all policy fields must yield a secure context (TLS 1.2 floor, Go default

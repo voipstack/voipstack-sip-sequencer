@@ -113,8 +113,10 @@ relay can read a live value race-free; everything else extends existing structs.
      verbatim, so hold/resume and codec changes ride through unchanged).
    - Edge: drive an in-dialog re-INVITE on the PBX leg with
      `pbxLeg.session.Do(ctx, reInvite)` (a `sip.INVITE` request carrying the anchored
-     re-offer body), then `Ack`. Parse the PBX answer (`parseMedia`) for its possibly-new
-     remote address.
+     re-offer body), then `Ack`. The in-dialog Request-URI is the PBX 200's `Contact`; if a
+     non-compliant PBX answered the original INVITE without one, respond `500` to the re-INVITE
+     and leave the established call/media untouched rather than dereference a nil Contact and
+     panic. Parse the PBX answer (`parseMedia`) for its possibly-new remote address.
    - Re-anchor the media relay in place: `MediaSession.reanchor(endpointSide, newEpAddr…)`
      and `reanchor(pbxSide, newPbxAddr…)` swap the atomic remote addresses; hold/resume is
      a natural consequence (on hold the holding side stops sending RTP; the relay simply has
