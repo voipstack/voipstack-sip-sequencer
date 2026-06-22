@@ -497,13 +497,19 @@ func (e *Engine) anchorMedia(call *Call) (mediaAnchor, bool) {
 
 	epSide.setRemote(udpAddrPair(epHost, epPort))
 
-	// Register release hook so teardown cleans up even on mid-setup failure.
-	// Tap pairs are released here too (they are on mediaSess.taps after registration).
+	// Register the media session and its teardown release hook (which also frees tap
+	// pairs once they are on mediaSess.taps). registerMedia refuses if the call is already
+	// tearing down, in which case the acquired ports and sockets would outlive the call, so
+	// release them here.
 	mediaSess := &MediaSession{endpointSide: epSide, pbxSide: pbxSide}
-	call.mu.Lock()
-	call.media = mediaSess
-	call.releaseMedia = mediaReleaser(mediaSess, e.ports, epPair, pbxPair)
-	call.mu.Unlock()
+	release := mediaReleaser(mediaSess, e.ports, epPair, pbxPair)
+	if !call.registerMedia(func() {
+		call.media = mediaSess
+		call.releaseMedia = release
+	}) {
+		release()
+		return mediaAnchor{}, false
+	}
 
 	return mediaAnchor{session: mediaSess, pbxSide: pbxSide, epPair: epPair, pbxPair: pbxPair}, true
 }
@@ -524,10 +530,14 @@ func (e *Engine) anchorWebRTC(call *Call) (mediaAnchor, bool) {
 	}
 
 	mediaSess := &MediaSession{endpointLeg: leg}
-	call.mu.Lock()
-	call.media = mediaSess
-	call.releaseMedia = mediaReleaser(mediaSess, e.ports)
-	call.mu.Unlock()
+	release := mediaReleaser(mediaSess, e.ports)
+	if !call.registerMedia(func() {
+		call.media = mediaSess
+		call.releaseMedia = release
+	}) {
+		release()
+		return mediaAnchor{}, false
+	}
 
 	return mediaAnchor{session: mediaSess, securedLeg: leg}, true
 }
@@ -584,12 +594,18 @@ func (e *Engine) bridgeSecuredToPBX(ctx context.Context, call *Call, anchor medi
 	}
 
 	// Register the PBX side on the existing media session (the secured endpoint leg is
-	// already set) and extend the release hook to free the PBX pair on teardown.
+	// already set) and extend the release hook to free the PBX pair on teardown. If the
+	// call is already tearing down, its earlier hook never saw this pair/socket, so release
+	// them here rather than leak them.
 	sess := anchor.session
-	call.mu.Lock()
-	sess.pbxSide = pbxSide
-	call.releaseMedia = mediaReleaser(sess, e.ports, pbxPair)
-	call.mu.Unlock()
+	if !call.registerMedia(func() {
+		sess.pbxSide = pbxSide
+		call.releaseMedia = mediaReleaser(sess, e.ports, pbxPair)
+	}) {
+		pbxSide.close()
+		e.ports.Release(pbxPair)
+		return false
+	}
 
 	// Plain RTP/AVP offer toward the PBX: same codecs, no ICE/DTLS/rtcp-mux.
 	pbxOffer, err := buildPlainOfferFromWebRTC(call.inbound.offerSDP, e.mediaHost, pbxPair.RTP)
