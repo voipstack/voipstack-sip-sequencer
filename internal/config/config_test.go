@@ -907,6 +907,56 @@ sequence: []
 	}
 }
 
+func TestIdleTimeoutDefaultsTo5mWhenOmitted(t *testing.T) {
+	cfg, err := config.Parse([]byte(completeYAML), "test.yaml")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RTP.IdleTimeoutDur != 5*time.Minute {
+		t.Errorf("IdleTimeoutDur = %v, want %v", cfg.RTP.IdleTimeoutDur, 5*time.Minute)
+	}
+}
+
+func TestIdleTimeoutParsesConfiguredValueAndZeroDisables(t *testing.T) {
+	mk := func(v string) string {
+		return `
+sip:
+  listen: "0.0.0.0:5060"
+next_hop:
+  uri: "sip:proxy.example.com"
+rtp:
+  port_range: "10000-20000"
+  idle_timeout: "` + v + `"
+sequence: []
+`
+	}
+	cfg, err := config.Parse([]byte(mk("90s")), "test.yaml")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RTP.IdleTimeoutDur != 90*time.Second {
+		t.Errorf("IdleTimeoutDur = %v, want 90s", cfg.RTP.IdleTimeoutDur)
+	}
+
+	// "0" disables the reaper.
+	cfg, err = config.Parse([]byte(mk("0")), "test.yaml")
+	if err != nil {
+		t.Fatalf("unexpected error for idle_timeout 0: %v", err)
+	}
+	if cfg.RTP.IdleTimeoutDur != 0 {
+		t.Errorf("IdleTimeoutDur = %v, want 0 (disabled)", cfg.RTP.IdleTimeoutDur)
+	}
+
+	// A negative value is rejected.
+	if _, err := config.Parse([]byte(mk("-5s")), "test.yaml"); err == nil {
+		t.Error("expected error for negative idle_timeout, got nil")
+	}
+	// A non-duration value is rejected.
+	if _, err := config.Parse([]byte(mk("nope")), "test.yaml"); err == nil {
+		t.Error("expected error for invalid idle_timeout, got nil")
+	}
+}
+
 func TestAppTimeoutParsesConfiguredValue(t *testing.T) {
 	// Given: an application with an explicit per-app timeout
 	yaml := `

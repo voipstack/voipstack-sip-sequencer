@@ -125,9 +125,15 @@ type ResolvedTLSProfile struct {
 	ConnectTimeout time.Duration
 }
 
-// RTP holds RTP port range configuration.
+// RTP holds RTP port range configuration. IdleTimeout is the optional media-inactivity
+// window: an established call that exchanges no RTP or RTCP (in either direction) for
+// longer than this is torn down, reclaiming its ports and relay goroutines when an
+// endpoint or PBX vanishes without a BYE. It is a Go duration string; an empty value
+// defaults to 5m and "0" disables the reaper. IdleTimeoutDur is the resolved value.
 type RTP struct {
-	PortRange string `yaml:"port_range"`
+	PortRange      string        `yaml:"port_range"`
+	IdleTimeout    string        `yaml:"idle_timeout"`
+	IdleTimeoutDur time.Duration `yaml:"-"`
 }
 
 // Media holds media-anchoring configuration. PublicAddress is the publicly
@@ -446,6 +452,9 @@ func validateTLSProfiles(c Config) error {
 // It matches the SIP INVITE client transaction Timer B (64*T1).
 const defaultLegTimeout = 32 * time.Second
 
+// defaultIdleTimeout is the media-inactivity window applied when rtp.idle_timeout is omitted.
+const defaultIdleTimeout = 5 * time.Minute
+
 // resolveTimeouts parses the global leg_timeout and each app's timeout into time.Duration,
 // defaulting the global to defaultLegTimeout when omitted and leaving an omitted per-app
 // timeout at zero (the "use the global default" sentinel). A present value must parse as a
@@ -475,6 +484,17 @@ func resolveTimeouts(cfg *Config) error {
 			return fmt.Errorf("sequence[%d] %q: timeout %q must be > 0", i, app.Name, app.Timeout)
 		}
 		app.TimeoutDur = d
+	}
+	cfg.RTP.IdleTimeoutDur = defaultIdleTimeout
+	if cfg.RTP.IdleTimeout != "" {
+		d, err := time.ParseDuration(cfg.RTP.IdleTimeout)
+		if err != nil {
+			return fmt.Errorf("invalid rtp.idle_timeout %q: %w", cfg.RTP.IdleTimeout, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("rtp.idle_timeout %q: must be >= 0 (0 disables)", cfg.RTP.IdleTimeout)
+		}
+		cfg.RTP.IdleTimeoutDur = d
 	}
 	return nil
 }

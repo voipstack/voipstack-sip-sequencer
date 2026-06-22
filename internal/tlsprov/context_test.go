@@ -238,6 +238,7 @@ func TestVerifySubjectsRestrictsPeers(t *testing.T) {
 
 	p := NewStdProvider(nil)
 	rp := writeProfile(t, "subjects", clientLeaf, root, func(rp *config.ResolvedTLSProfile) {
+		rp.VerifyPeer = true
 		rp.VerifySubjects = []string{"CN=phone.internal"}
 	})
 	cliCfg, err := p.ClientConfig(rp)
@@ -269,6 +270,7 @@ func TestVerifyDepthCapsChain(t *testing.T) {
 
 	// verify_depth:0 rejects a chain with one intermediate.
 	rp0 := writeProfile(t, "depth0", clientLeaf, root, func(rp *config.ResolvedTLSProfile) {
+		rp.VerifyPeer = true
 		rp.VerifyDepth = 0
 	})
 	cfg0, err := p.ClientConfig(rp0)
@@ -281,6 +283,7 @@ func TestVerifyDepthCapsChain(t *testing.T) {
 
 	// verify_depth:1 accepts it.
 	rp1 := writeProfile(t, "depth1", clientLeaf, root, func(rp *config.ResolvedTLSProfile) {
+		rp.VerifyPeer = true
 		rp.VerifyDepth = 1
 	})
 	cfg1, err := p.ClientConfig(rp1)
@@ -376,7 +379,7 @@ func TestVerifyDatesToggle(t *testing.T) {
 	p := NewStdProvider(nil)
 
 	// verify_dates:true rejects an expired remote.
-	strict, err := p.ClientConfig(writeProfile(t, "dates-strict", clientLeaf, root, nil))
+	strict, err := p.ClientConfig(writeProfile(t, "dates-strict", clientLeaf, root, func(rp *config.ResolvedTLSProfile) { rp.VerifyPeer = true }))
 	if err != nil {
 		t.Fatalf("ClientConfig strict: %v", err)
 	}
@@ -387,6 +390,7 @@ func TestVerifyDatesToggle(t *testing.T) {
 
 	// verify_dates:false accepts the expired remote (chain still validated).
 	relaxed, err := p.ClientConfig(writeProfile(t, "dates-relaxed", clientLeaf, root, func(rp *config.ResolvedTLSProfile) {
+		rp.VerifyPeer = true
 		rp.VerifyDates = false
 	}))
 	if err != nil {
@@ -413,7 +417,7 @@ func TestClientValidatesAgainstCA(t *testing.T) {
 	outOfBundle := serverAuth(t, "server", other, "server.test")
 
 	p := NewStdProvider(nil)
-	cliCfg, err := p.ClientConfig(writeProfile(t, "ca", clientLeaf, root, nil))
+	cliCfg, err := p.ClientConfig(writeProfile(t, "ca", clientLeaf, root, func(rp *config.ResolvedTLSProfile) { rp.VerifyPeer = true }))
 	if err != nil {
 		t.Fatalf("ClientConfig: %v", err)
 	}

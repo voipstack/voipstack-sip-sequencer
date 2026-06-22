@@ -201,9 +201,10 @@ func TestOutboundMutualTLSPresentsClientCert(t *testing.T) {
 	inviteAndWait200(t, newFakeUAC(t), "sip:"+listenAddr, app, pbx)
 }
 
-// AC3: a remote whose server cert is signed by a CA the profile does not trust is
-// refused; with on_failure: skip the failure is confined to that app (it never reaches
-// the fake) and the call proceeds to the next hop.
+// AC3: with verify_peer enabled, a remote whose server cert is signed by a CA the profile
+// does not trust is refused; with on_failure: skip the failure is confined to that app (it
+// never reaches the fake) and the call proceeds to the next hop. (Validation is opt-in: the
+// default relaxed/encrypt-only posture would accept the untrusted cert.)
 func TestUntrustedRemoteRefusedThenSkip(t *testing.T) {
 	// Client profile trusts caCK; the server presents a cert from a different CA.
 	caCK := mintCert(t, "trusted-ca", nil, true, nil, nil)
@@ -212,6 +213,7 @@ func TestUntrustedRemoteRefusedThenSkip(t *testing.T) {
 	rogueSrv := mintCert(t, "rogue-server", rogueCA, false, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, []net.IP{net.ParseIP("127.0.0.1")})
 
 	rp := writeClientProfile(t, "outbound", cliCK, caCK)
+	rp.VerifyPeer = true // opt into validation so the untrusted server cert is rejected
 	app := newFakeUASTLS(t, serverTLSConf(rogueSrv, false, nil))
 	pbx := newFakeUAS(t)
 

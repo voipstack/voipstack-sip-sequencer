@@ -11,6 +11,7 @@ next_hop:
 
 rtp:
   port_range: 10000-20000     # UDP port range the anchored RTP sessions allocate from
+  idle_timeout: 5m            # reap a call with no RTP/RTCP for this long (endpoint/PBX gone, no BYE); 0 disables
 
 # Ordered chain of external SIP applications each call is sequenced through.
 # Application legs always use TCP (the offer carries the caller's SDP, which can

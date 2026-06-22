@@ -257,6 +257,90 @@ func TestReInvitePropagatesToPBXLeg(t *testing.T) {
 	}
 }
 
+// fakeUASNoContact is a raw UAS that answers the initial INVITE with a 200 OK carrying
+// NO Contact header (a non-RFC-compliant upstream). It drives the sequencer's mid-call
+// path against a Contact-less established PBX dialog. It is intentionally not built on
+// the DialogServerCache, which would insert a Contact automatically.
+type fakeUASNoContact struct{ addr string }
+
+func newFakeUASNoContact(t *testing.T, answerSDP []byte) *fakeUASNoContact {
+	t.Helper()
+	ua, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("fakeUASNoContact UA: %v", err)
+	}
+	srv, err := sipgo.NewServer(ua)
+	if err != nil {
+		t.Fatalf("fakeUASNoContact server: %v", err)
+	}
+	l, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("fakeUASNoContact listen: %v", err)
+	}
+	addr := l.LocalAddr().String()
+
+	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
+		res := sip.NewResponseFromRequest(req, 200, "OK", answerSDP)
+		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		// Deliberately no Contact header: NewResponseFromRequest does not copy one.
+		_ = tx.Respond(res)
+		<-tx.Done() // keep the tx alive to absorb the ACK / 2xx retransmits
+	})
+	srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) {})
+	srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
+	})
+
+	go srv.ServeUDP(l) //nolint:errcheck
+	t.Cleanup(func() { l.Close() })
+	return &fakeUASNoContact{addr: addr}
+}
+
+func (f *fakeUASNoContact) sipURI() string { return "sip:" + f.addr }
+
+// Given an established call whose PBX answered the initial INVITE with no Contact
+// header; When the endpoint sends an in-dialog re-INVITE; Then the sequencer replies
+// 5xx and the process survives. Before the fix, handleReInvite dereferenced the nil
+// Contact on the cached PBX 200 (pbxSess.InviteResponse.Contact().Address) and panicked
+// the handler goroutine — and sipgo has no recover, so the whole process crashed.
+func TestReInviteWithContactlessPBXDoesNotPanic(t *testing.T) {
+	app := newFakeUAS(t)
+	pbx := newFakeUASNoContact(t, []byte(testSDP2))
+	caller := newFakeUAC(t)
+
+	listenAddr := freeAddr(t)
+	startEngine(t, testConfig(listenAddr, app.sipURI(), pbx.sipURI()), 0)
+	ctx := context.Background()
+
+	autoAnswer(t, app, "", nil)
+
+	sess, err := caller.invite(ctx, "sip:"+listenAddr, sdpWithAddr("127.0.0.1", 20800))
+	if err != nil {
+		t.Fatalf("caller invite: %v", err)
+	}
+	if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("WaitAnswer: %v", err)
+	}
+	if err := sess.Ack(ctx); err != nil {
+		t.Fatalf("ACK: %v", err)
+	}
+
+	// Let the established-state transition settle so the re-INVITE is not 481'd.
+	time.Sleep(150 * time.Millisecond)
+
+	reInvite := sip.NewRequest(sip.INVITE, sess.InviteResponse.Contact().Address)
+	reInvite.SetBody(sdpWithAddr("127.0.0.1", 20900))
+	reInvite.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+
+	res, err := sess.Do(ctx, reInvite)
+	if err != nil {
+		t.Fatalf("re-INVITE Do: %v", err)
+	}
+	if res.StatusCode < 500 || res.StatusCode > 599 {
+		t.Fatalf("re-INVITE against contactless PBX dialog: want 5xx, got %d", res.StatusCode)
+	}
+}
+
 // Given established call; When endpoint sends re-INVITE; Then appLegs count and order
 // are unchanged (no chain re-run, AC5).
 func TestReInviteDoesNotRerunChain(t *testing.T) {

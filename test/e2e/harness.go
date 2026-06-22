@@ -173,6 +173,7 @@ type yamlTLSProfile struct {
 	Key        string
 	CA         string
 	MinVersion string
+	VerifyPeer bool
 }
 
 // yamlConfig is the typed source for the generated config file. Marshalling from
@@ -231,6 +232,9 @@ func (c yamlConfig) marshalYAML() ([]byte, error) {
 			}
 			if p.MinVersion != "" {
 				m["min_version"] = p.MinVersion
+			}
+			if p.VerifyPeer {
+				m["verify_peer"] = true
 			}
 			profiles[name] = m
 		}

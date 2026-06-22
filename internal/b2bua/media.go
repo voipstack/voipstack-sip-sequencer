@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ErrPortsExhausted is returned by PortAllocator.Acquire when the range is full.
@@ -78,6 +79,15 @@ func (s *AnchorSide) setRemote(rtp, rtcp *net.UDPAddr) {
 
 func (s *AnchorSide) loadRemoteRTP() *net.UDPAddr  { return s.remoteRTP.Load() }
 func (s *AnchorSide) loadRemoteRTCP() *net.UDPAddr { return s.remoteRTCP.Load() }
+
+// udpAddrPair builds the RTP and its companion RTCP (RTP+1) UDP destinations for a media
+// endpoint from its host and even RTP port. host must be an IP literal — every caller
+// takes it from parseMedia/parseTapAnswer, which reject non-IP hosts — so net.ParseIP
+// never yields a nil-IP (poisoned) address here.
+func udpAddrPair(host string, rtpPort int) (rtp, rtcp *net.UDPAddr) {
+	ip := net.ParseIP(host)
+	return &net.UDPAddr{IP: ip, Port: rtpPort}, &net.UDPAddr{IP: ip, Port: rtpPort + 1}
+}
 
 // newAnchorSide binds RTP and RTCP UDP sockets on mediaHost using the given pair.
 func newAnchorSide(mediaHost string, pair PortPair) (*AnchorSide, error) {
@@ -176,6 +186,9 @@ type MediaSession struct {
 	tapsMu       sync.Mutex
 	taps         []*Tap
 	closeOnce    sync.Once
+	// lastActivity is the unix-nanos timestamp of the most recent RTP/RTCP packet seen in
+	// any direction; 0 until the relay starts. The idle reaper reads it (see idleFor).
+	lastActivity atomic.Int64
 }
 
 // addTap registers a tap. Registration normally completes before relay starts,
@@ -194,6 +207,22 @@ func (m *MediaSession) tapList() []*Tap {
 	out := make([]*Tap, len(m.taps))
 	copy(out, m.taps)
 	return out
+}
+
+// markActivity records that a media packet was just seen in some direction. Every relay
+// read loop (RTP and RTCP, both directions) and the relay/bridge start call it, so a call
+// on hold — which still exchanges RTCP — keeps a fresh timestamp. The idle reaper reads it.
+func (m *MediaSession) markActivity() { m.lastActivity.Store(time.Now().UnixNano()) }
+
+// idleFor returns how long the session has gone without any media packet, relative to now.
+// A session that has never recorded activity (lastActivity == 0) reports 0 — never idle —
+// so a session is never reaped before its relay has started.
+func (m *MediaSession) idleFor(now time.Time) time.Duration {
+	last := m.lastActivity.Load()
+	if last == 0 {
+		return 0
+	}
+	return now.Sub(time.Unix(0, last))
 }
 
 // reanchor atomically swaps the relay destination on one anchor side without
@@ -224,10 +253,22 @@ func (m *MediaSession) Close() {
 
 const rtpBufSize = 1500
 
-// relay starts goroutines copying packets between the two sides, fanning out to taps.
-// Returns when ctx is cancelled or sockets are closed.
+// debugUnlessShutdown logs a relay/bridge debug message, suppressed when ctx is already
+// cancelled — a closed socket during teardown is an expected stop, not a real error.
+func debugUnlessShutdown(ctx context.Context, msg string, args ...any) {
+	select {
+	case <-ctx.Done():
+	default:
+		slog.Debug(msg, args...)
+	}
+}
+
+// relay bridges the two plain anchored sides (endpoint and PBX) in both directions,
+// fanning RTP out to taps. A plain relay is just a bridge between two AnchorSides — each
+// satisfies MediaLeg, whose WriteRTP/WriteRTCP already load the destination atomically and
+// drop on a nil remote — so it delegates to bridgeLegs, the single security-agnostic copy
+// path. Returns when ctx is cancelled or sockets are closed.
 func (m *MediaSession) relay(ctx context.Context) {
-	// Snapshot tap slices at relay start — no mutation after this point.
 	taps := m.tapList()
 	callerTaps := make([]*AnchorSide, 0, len(taps))
 	calleeTaps := make([]*AnchorSide, 0, len(taps))
@@ -235,83 +276,7 @@ func (m *MediaSession) relay(ctx context.Context) {
 		callerTaps = append(callerTaps, t.callerStream)
 		calleeTaps = append(calleeTaps, t.calleeStream)
 	}
-
-	var wg sync.WaitGroup
-	wg.Add(4)
-
-	// caller direction: endpoint-facing → PBX-facing
-	go func() {
-		defer wg.Done()
-		copyUDPFanout(ctx, m.endpointSide.rtpConn, m.pbxSide.rtpConn, &m.pbxSide.remoteRTP, callerTaps)
-	}()
-	// callee direction: PBX-facing → endpoint-facing
-	go func() {
-		defer wg.Done()
-		copyUDPFanout(ctx, m.pbxSide.rtpConn, m.endpointSide.rtpConn, &m.endpointSide.remoteRTP, calleeTaps)
-	}()
-	// RTCP caller direction
-	go func() {
-		defer wg.Done()
-		copyUDP(ctx, m.endpointSide.rtcpConn, m.pbxSide.rtcpConn, &m.pbxSide.remoteRTCP)
-	}()
-	// RTCP callee direction
-	go func() {
-		defer wg.Done()
-		copyUDP(ctx, m.pbxSide.rtcpConn, m.endpointSide.rtcpConn, &m.endpointSide.remoteRTCP)
-	}()
-
-	<-ctx.Done()
-	m.Close()
-	wg.Wait()
-}
-
-// copyUDPFanout reads packets from readConn, writes each to primary (loaded atomically
-// per packet), then to each tap's RTP socket. A nil primary drops the packet. Tap write
-// errors are logged and skipped.
-func copyUDPFanout(ctx context.Context, readConn, writeConn *net.UDPConn, primary *atomic.Pointer[net.UDPAddr], tapSides []*AnchorSide) {
-	buf := make([]byte, rtpBufSize)
-	for {
-		n, err := readConn.Read(buf)
-		if err != nil {
-			select {
-			case <-ctx.Done():
-			default:
-				slog.Debug("relay read", "err", err)
-			}
-			return
-		}
-		pkt := buf[:n]
-
-		dst := primary.Load()
-		if dst != nil {
-			if _, err := writeConn.WriteTo(pkt, dst); err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					slog.Debug("relay write primary", "dst", dst, "err", err)
-					return
-				}
-			}
-		}
-
-		for _, tap := range tapSides {
-			if tap == nil {
-				continue
-			}
-			tapDst := tap.loadRemoteRTP()
-			if tapDst == nil {
-				continue
-			}
-			if _, err := tap.rtpConn.WriteTo(pkt, tapDst); err != nil {
-				select {
-				case <-ctx.Done():
-				default:
-					slog.Debug("tap write", "app", tap.localRTPPort, "err", err)
-				}
-			}
-		}
-	}
+	m.bridgeLegs(ctx, m.endpointSide, m.pbxSide, callerTaps, calleeTaps)
 }
 
 // bridgeLegs relays decrypted RTP and RTCP between two media legs in both directions,
@@ -322,28 +287,29 @@ func copyUDPFanout(ctx context.Context, readConn, writeConn *net.UDPConn, primar
 // receive the a→b direction, calleeTaps the b→a direction. Returns when ctx is
 // cancelled or a leg is closed.
 func (m *MediaSession) bridgeLegs(ctx context.Context, a, b MediaLeg, callerTaps, calleeTaps []*AnchorSide) {
+	m.markActivity()
 	var wg sync.WaitGroup
 	wg.Add(4)
 
 	// RTP a→b (e.g. webphone → PBX), fanning out to caller-direction taps.
 	go func() {
 		defer wg.Done()
-		copyLegRTP(ctx, a, b, callerTaps)
+		copyLegRTP(ctx, a, b, callerTaps, m.markActivity)
 	}()
 	// RTP b→a (e.g. PBX → webphone), fanning out to callee-direction taps.
 	go func() {
 		defer wg.Done()
-		copyLegRTP(ctx, b, a, calleeTaps)
+		copyLegRTP(ctx, b, a, calleeTaps, m.markActivity)
 	}()
 	// RTCP a→b.
 	go func() {
 		defer wg.Done()
-		copyLegRTCP(ctx, a, b)
+		copyLegRTCP(ctx, a, b, m.markActivity)
 	}()
 	// RTCP b→a.
 	go func() {
 		defer wg.Done()
-		copyLegRTCP(ctx, b, a)
+		copyLegRTCP(ctx, b, a, m.markActivity)
 	}()
 
 	<-ctx.Done()
@@ -355,26 +321,19 @@ func (m *MediaSession) bridgeLegs(ctx context.Context, a, b MediaLeg, callerTaps
 // dst's outbound security), then fans the plaintext out to each tap's RTP socket. A
 // read or write error logs at debug and stops this direction only — best-effort,
 // call-isolated. Tap write errors are logged and skipped, never blocking the primary.
-func copyLegRTP(ctx context.Context, src, dst MediaLeg, tapSides []*AnchorSide) {
+func copyLegRTP(ctx context.Context, src, dst MediaLeg, tapSides []*AnchorSide, mark func()) {
 	buf := make([]byte, rtpBufSize)
 	for {
 		n, err := src.ReadRTP(buf)
 		if err != nil {
-			select {
-			case <-ctx.Done():
-			default:
-				slog.Debug("bridge read rtp", "err", err)
-			}
+			debugUnlessShutdown(ctx, "bridge read rtp", "err", err)
 			return
 		}
+		mark()
 		pkt := buf[:n]
 
 		if _, err := dst.WriteRTP(pkt); err != nil {
-			select {
-			case <-ctx.Done():
-			default:
-				slog.Debug("bridge write rtp", "err", err)
-			}
+			debugUnlessShutdown(ctx, "bridge write rtp", "err", err)
 			return
 		}
 
@@ -387,11 +346,7 @@ func copyLegRTP(ctx context.Context, src, dst MediaLeg, tapSides []*AnchorSide) 
 				continue
 			}
 			if _, err := tap.rtpConn.WriteTo(pkt, tapDst); err != nil {
-				select {
-				case <-ctx.Done():
-				default:
-					slog.Debug("tap write", "app", tap.localRTPPort, "err", err)
-				}
+				debugUnlessShutdown(ctx, "tap write", "app", tap.localRTPPort, "err", err)
 			}
 		}
 	}
@@ -400,53 +355,17 @@ func copyLegRTP(ctx context.Context, src, dst MediaLeg, tapSides []*AnchorSide) 
 // copyLegRTCP reads one decrypted RTCP packet from src and writes it to dst, applying
 // dst's outbound security. A read or write error logs at debug and stops this direction
 // only — best-effort, call-isolated.
-func copyLegRTCP(ctx context.Context, src, dst MediaLeg) {
+func copyLegRTCP(ctx context.Context, src, dst MediaLeg, mark func()) {
 	buf := make([]byte, rtpBufSize)
 	for {
 		n, err := src.ReadRTCP(buf)
 		if err != nil {
-			select {
-			case <-ctx.Done():
-			default:
-				slog.Debug("bridge read rtcp", "err", err)
-			}
+			debugUnlessShutdown(ctx, "bridge read rtcp", "err", err)
 			return
 		}
+		mark()
 		if _, err := dst.WriteRTCP(buf[:n]); err != nil {
-			select {
-			case <-ctx.Done():
-			default:
-				slog.Debug("bridge write rtcp", "err", err)
-			}
-			return
-		}
-	}
-}
-
-// copyUDP reads packets from readConn and writes to the destination loaded atomically
-// from dst per packet. A nil destination drops the packet silently.
-func copyUDP(ctx context.Context, readConn, writeConn *net.UDPConn, dst *atomic.Pointer[net.UDPAddr]) {
-	buf := make([]byte, rtpBufSize)
-	for {
-		n, err := readConn.Read(buf)
-		if err != nil {
-			select {
-			case <-ctx.Done():
-			default:
-				slog.Debug("relay read", "err", err)
-			}
-			return
-		}
-		addr := dst.Load()
-		if addr == nil {
-			continue
-		}
-		if _, err := writeConn.WriteTo(buf[:n], addr); err != nil {
-			select {
-			case <-ctx.Done():
-			default:
-				slog.Debug("relay write", "dst", addr, "err", err)
-			}
+			debugUnlessShutdown(ctx, "bridge write rtcp", "err", err)
 			return
 		}
 	}

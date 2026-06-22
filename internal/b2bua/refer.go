@@ -3,7 +3,6 @@ package b2bua
 import (
 	"context"
 	"log/slog"
-	"net"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -113,11 +112,10 @@ func (e *Engine) handleRefer(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 
-	newTargetRTP := &net.UDPAddr{IP: net.ParseIP(targetHost), Port: targetRTPPort}
-	newTargetRTCP := &net.UDPAddr{IP: net.ParseIP(targetHost), Port: targetRTPPort + 1}
+	targetRTP, targetRTCP := udpAddrPair(targetHost, targetRTPPort)
 
 	call.mu.Lock()
-	media.reanchor(media.endpointSide, newTargetRTP, newTargetRTCP)
+	media.reanchor(media.endpointSide, targetRTP, targetRTCP)
 	call.transferTarget = targetSess
 	call.mu.Unlock()
 

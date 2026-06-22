@@ -3,7 +3,6 @@ package b2bua
 import (
 	"context"
 	"log/slog"
-	"net"
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
@@ -64,8 +63,18 @@ func (e *Engine) handleReInvite(call *Call, inbound *sipgo.DialogServerSession, 
 		return
 	}
 
-	// Send in-dialog re-INVITE to PBX.
-	contactURI := pbxSess.InviteResponse.Contact().Address
+	// Send in-dialog re-INVITE to PBX. A 2xx to the original INVITE must carry a
+	// Contact (RFC 3261 §13.2.2.4) to give the in-dialog target; a non-compliant PBX
+	// that omitted it leaves no remote target, so we fail the re-INVITE rather than
+	// dereference a nil Contact and panic the whole process. The established call and
+	// its media are left untouched.
+	contactHdr := pbxSess.InviteResponse.Contact()
+	if contactHdr == nil {
+		slog.Warn("re-INVITE: PBX dialog has no Contact, cannot reach next hop", "callID", call.id)
+		_ = tx.Respond(sip.NewResponseFromRequest(req, 500, "Server Error", nil))
+		return
+	}
+	contactURI := contactHdr.Address
 	reInvite := sip.NewRequest(sip.INVITE, contactURI)
 	reInvite.SetBody(pbxReOffer)
 	reInvite.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
@@ -105,14 +114,12 @@ func (e *Engine) handleReInvite(call *Call, inbound *sipgo.DialogServerSession, 
 
 	// Atomically re-anchor both sides; the relay goroutines pick up the new
 	// addresses on their next packet without restart.
-	newEpRTP := &net.UDPAddr{IP: net.ParseIP(epHost), Port: epRTPPort}
-	newEpRTCP := &net.UDPAddr{IP: net.ParseIP(epHost), Port: epRTPPort + 1}
-	newPbxRTP := &net.UDPAddr{IP: net.ParseIP(pbxHost), Port: pbxRTPPort}
-	newPbxRTCP := &net.UDPAddr{IP: net.ParseIP(pbxHost), Port: pbxRTPPort + 1}
+	epRTP, epRTCP := udpAddrPair(epHost, epRTPPort)
+	pbxRTP, pbxRTCP := udpAddrPair(pbxHost, pbxRTPPort)
 
 	call.mu.Lock()
-	media.reanchor(media.endpointSide, newEpRTP, newEpRTCP)
-	media.reanchor(media.pbxSide, newPbxRTP, newPbxRTCP)
+	media.reanchor(media.endpointSide, epRTP, epRTCP)
+	media.reanchor(media.pbxSide, pbxRTP, pbxRTCP)
 	call.pbxLeg.answerSDP = pbxAnswerRaw
 	call.mu.Unlock()
 
