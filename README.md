@@ -84,6 +84,7 @@ next_hop:                       # terminating next-hop (PBX) — object form
   transport: udp                # udp | tcp | tls (default udp; tls needs tls_profile)
 rtp:
   port_range: 10000-20000       # anchored media port range
+  idle_timeout: 5m              # tear down a call idle of all RTP/RTCP this long (default 5m; 0 disables)
 observability:
   listen: 0.0.0.0:9090          # Prometheus /metrics + /health (omit to disable)
 log_level: info                 # debug | info | warn | error (default info)
@@ -152,8 +153,12 @@ silent peer short of Timer B). On expiry the app's `on_failure` decides skip vs 
 
 Named, reusable `tls_profiles` (certificate material + crypto/verification/timeout
 policy) are referenced by name from TLS endpoints — the optional `tls.listen` listener,
-`sequence` items, and `next_hop`. Defaults are secure: TLS 1.2 floor, peer verification
-off, verify depth 2, dates checked.
+`sequence` items, and `next_hop`. Defaults: TLS 1.2 floor, verify depth 2, dates checked.
+**Peer verification is off by default** — an inbound listener requires no client
+certificate, and an **outbound leg is encrypt-only: it accepts any server certificate**
+(self-signed, expired, hostname mismatch, untrusted CA). Set `verify_peer: true` on a
+profile to validate the peer: mutual TLS on an inbound listener, or full chain + dates +
+hostname verification on an outbound leg.
 
 ```yaml
 tls:                            # optional TLS listener (coexists with sip.listen)
@@ -183,7 +188,7 @@ tls_profiles:
 | `ca`              | Optional CA bundle for peer verification.                          |
 | `min_version`     | `tlsv1.2` *(default)* \| `tlsv1.3`.                                 |
 | `ciphers`         | Optional cipher list (validated by the TLS provider, not here).    |
-| `verify_peer`     | Verify the peer certificate. **Default `false`.**                  |
+| `verify_peer`     | Validate the peer certificate. **Default `false`** — inbound requires no client cert; outbound is encrypt-only (any server cert accepted). `true` enforces mTLS (inbound) / chain + dates + hostname (outbound). |
 | `verify_depth`    | Max chain depth. **Default `2`.**                                  |
 | `verify_dates`    | Enforce cert validity dates. **Default `true`.**                   |
 | `verify_subjects` | Optional list of allowed certificate subjects.                     |

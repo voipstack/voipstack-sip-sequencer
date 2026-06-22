@@ -200,9 +200,10 @@ func TestAppLegMutualTLS(t *testing.T) {
 	establish(t, caller, s.sipListen)
 }
 
-// Given a TLS app whose server cert is signed by an untrusted CA, with on_failure:
-// skip; When a call arrives; Then the handshake fails, the app never sees the
-// INVITE, and the call proceeds to the PBX.
+// Given a TLS app with verify_peer enabled whose server cert is signed by an untrusted
+// CA, with on_failure: skip; When a call arrives; Then the handshake fails, the app
+// never sees the INVITE, and the call proceeds to the PBX. (Validation is opt-in: the
+// default relaxed/encrypt-only posture would accept the untrusted cert.)
 func TestUntrustedTLSAppSkipped(t *testing.T) {
 	trustedCA := mintCert(t, "trusted-ca", nil, true, nil, nil)
 	cliCK := mintCert(t, "sequencer-client", trustedCA, false, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil)
@@ -219,7 +220,9 @@ func TestUntrustedTLSAppSkipped(t *testing.T) {
 		Name: "secure", URI: app.sipURI(), Transport: "tls", TLSProfile: "appsec",
 		Media: "none", OnFailure: "skip",
 	}})
-	cfg.TLSProfiles = map[string]yamlTLSProfile{"appsec": clientProfile(t, cliCK, trustedCA)}
+	prof := clientProfile(t, cliCK, trustedCA)
+	prof.VerifyPeer = true // opt into validation so the untrusted server cert is rejected
+	cfg.TLSProfiles = map[string]yamlTLSProfile{"appsec": prof}
 	s := startReady(t, cfg)
 
 	// Skipped on the untrusted handshake — the PBX answers and the call connects.

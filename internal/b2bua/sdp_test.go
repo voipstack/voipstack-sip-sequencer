@@ -83,6 +83,20 @@ func TestParseMedia(t *testing.T) {
 			sdp:     "v=0\r\nm=audio 5004 RTP/AVP 0\r\n",
 			wantErr: true,
 		},
+		{
+			// An FQDN in c= cannot be relayed to (the sequencer resolves nothing and
+			// anchors IP:port), and net.ParseIP returns nil for it — which would build a
+			// poisoned *net.UDPAddr{IP: nil} that bypasses the relay's nil-address guard
+			// and silently kills that media direction. Reject it at parse instead.
+			name:    "c= host is an FQDN, not an IP literal",
+			sdp:     "v=0\r\nc=IN IP4 pbx.example.com\r\nm=audio 5004 RTP/AVP 0\r\n",
+			wantErr: true,
+		},
+		{
+			name:    "c= host is malformed",
+			sdp:     "v=0\r\nc=IN IP4 not-an-ip\r\nm=audio 5004 RTP/AVP 0\r\n",
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {

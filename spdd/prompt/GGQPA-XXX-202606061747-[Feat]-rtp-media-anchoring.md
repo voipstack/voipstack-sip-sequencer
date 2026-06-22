@@ -33,7 +33,10 @@ at startup; allocate an RTP/RTCP port pair per anchored side from that range; re
 answer returned to the endpoint (from the PBX answer) so both peers send RTP to the
 sequencer; relay packets byte-for-byte in both directions (RTP and RTCP); release ports and
 stop relaying on teardown; fail a new call cleanly when the range is exhausted without
-disrupting established calls.
+disrupting established calls. Reject an SDP whose `c=` host is not an IP literal (the sequencer
+relays to a concrete IP:port and resolves nothing). Tear down an established call whose media —
+RTP or RTCP, either direction — goes idle past `rtp.idle_timeout` (default 5m; `0` disables),
+reclaiming its ports and relay goroutines when a peer vanishes without a BYE.
 
 Boundaries: endpoint↔PBX call only (no per-app fork — story 010); no transcoding / mixing /
 resampling (copy only); SDP-signaled addressing (no NAT latching); one audio stream; UDP;

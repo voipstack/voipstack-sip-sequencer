@@ -158,7 +158,7 @@ Notes (conservative design — smallest types that satisfy the ACs):
      RTP RTP \`yaml:"rtp"\`; Sequence []Application \`yaml:"sequence"\` }`
      — plus a presence flag for `sequence` (see Parse) to tell absent from empty.
    - `type SIP struct { Listen string \`yaml:"listen"\` }`
-   - `type RTP struct { PortRange string \`yaml:"port_range"\` }`
+   - `type RTP struct { PortRange string \`yaml:"port_range"\`; IdleTimeout string \`yaml:"idle_timeout"\`; IdleTimeoutDur time.Duration \`yaml:"-"\` }`
    - `type Application struct { Name string \`yaml:"name"\`; URI string \`yaml:"uri"\`;
      OnFailure FailurePolicy \`yaml:"on_failure"\` }`
    - `type FailurePolicy string` with `const ( FailureSkip FailurePolicy = "skip";
@@ -186,6 +186,7 @@ Notes (conservative design — smallest types that satisfy the ACs):
    - `c.SIP.Listen == ""` ⇒ `missing required key "sip.listen"`.
    - `c.NextHop == ""` ⇒ `missing required key "next_hop"`.
    - `c.RTP.PortRange == ""` ⇒ `missing required key "rtp.port_range"`.
+   - `rtp.idle_timeout` (optional, Go duration): empty ⇒ default `5m`; `"0"` disables the media-inactivity reaper; a negative value is rejected. Resolved into `IdleTimeoutDur`.
    - `!sequencePresent` ⇒ `missing required key "sequence"` (empty list is OK).
    - For each `i, app := range c.Sequence`:
      - `app.Name == ""` ⇒ `sequence[i]: missing required key "name"`.

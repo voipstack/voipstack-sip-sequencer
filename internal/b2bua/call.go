@@ -85,6 +85,21 @@ func (c *Call) forwardHeaders() []sip.Header {
 	return out
 }
 
+// registerMedia runs fn — which records this call's media session and its teardown
+// release hook — under the call lock, unless the call is already tearing down. It returns
+// false in that case so the caller releases the media resources it just acquired: a
+// concurrent teardown ran before they were tracked, so its release hook never saw them.
+// This closes the acquire-then-register window in the media setup paths.
+func (c *Call) registerMedia(fn func()) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == stateTearingDown {
+		return false
+	}
+	fn()
+	return true
+}
+
 // teardown idempotently shuts down a call: cancels its context, sends BYE on
 // every live dialog, and removes it from the registry. Safe to call from multiple
 // goroutines simultaneously (glare-safe).

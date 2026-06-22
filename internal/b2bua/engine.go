@@ -40,6 +40,7 @@ type Engine struct {
 	runCtx          context.Context
 	runCancel       context.CancelFunc
 	legTimeout      time.Duration
+	idleTimeout     time.Duration
 	ports           *PortAllocator
 	mediaHost       string
 	mediaPublicAddr string
@@ -142,6 +143,7 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 		metrics:         noopMetrics{},
 		tlsDialers:      map[string]*sipgo.DialogClientCache{},
 		legTimeout:      legTimeout,
+		idleTimeout:     cfg.RTP.IdleTimeoutDur,
 		ports:           newPortAllocator(portMin, portMax),
 		mediaHost:       host,
 		mediaPublicAddr: mediaPublicAddr,
@@ -271,6 +273,12 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	if e.obsListen != "" {
 		e.startObservability(ctx)
+	}
+
+	// Reap established calls whose media has gone silent (endpoint or PBX vanished without
+	// a BYE) so their ports and relay goroutines are reclaimed. Disabled when idle_timeout is 0.
+	if e.idleTimeout > 0 {
+		e.startReaper(ctx)
 	}
 
 	// Plain UDP and TLS run as independent sockets on the shared server. errgroup

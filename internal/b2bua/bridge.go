@@ -386,11 +386,14 @@ func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 				// Treat parse failure same as app failure.
 				tap.release(e.ports)
 			} else {
-				if p1 > 0 {
-					tap.callerSide.setRemote(&net.UDPAddr{IP: net.ParseIP(h1), Port: p1}, nil)
+				// A tap is a best-effort observer: a stream whose answer host is not an
+				// IP literal is simply not forwarded (leaving the side's remote nil), not
+				// poisoned with a nil-IP address that the relay would fail to write to.
+				if ip := net.ParseIP(h1); p1 > 0 && ip != nil {
+					tap.callerSide.setRemote(&net.UDPAddr{IP: ip, Port: p1}, nil)
 				}
-				if p2 > 0 {
-					tap.calleeSide.setRemote(&net.UDPAddr{IP: net.ParseIP(h2), Port: p2}, nil)
+				if ip := net.ParseIP(h2); p2 > 0 && ip != nil {
+					tap.calleeSide.setRemote(&net.UDPAddr{IP: ip, Port: p2}, nil)
 				}
 				t := &Tap{
 					appName:      app.Name,
@@ -492,18 +495,21 @@ func (e *Engine) anchorMedia(call *Call) (mediaAnchor, bool) {
 		return mediaAnchor{}, false
 	}
 
-	epSide.setRemote(
-		&net.UDPAddr{IP: net.ParseIP(epHost), Port: epPort},
-		&net.UDPAddr{IP: net.ParseIP(epHost), Port: epPort + 1},
-	)
+	epSide.setRemote(udpAddrPair(epHost, epPort))
 
-	// Register release hook so teardown cleans up even on mid-setup failure.
-	// Tap pairs are released here too (they are on mediaSess.taps after registration).
+	// Register the media session and its teardown release hook (which also frees tap
+	// pairs once they are on mediaSess.taps). registerMedia refuses if the call is already
+	// tearing down, in which case the acquired ports and sockets would outlive the call, so
+	// release them here.
 	mediaSess := &MediaSession{endpointSide: epSide, pbxSide: pbxSide}
-	call.mu.Lock()
-	call.media = mediaSess
-	call.releaseMedia = mediaReleaser(mediaSess, e.ports, epPair, pbxPair)
-	call.mu.Unlock()
+	release := mediaReleaser(mediaSess, e.ports, epPair, pbxPair)
+	if !call.registerMedia(func() {
+		call.media = mediaSess
+		call.releaseMedia = release
+	}) {
+		release()
+		return mediaAnchor{}, false
+	}
 
 	return mediaAnchor{session: mediaSess, pbxSide: pbxSide, epPair: epPair, pbxPair: pbxPair}, true
 }
@@ -524,10 +530,14 @@ func (e *Engine) anchorWebRTC(call *Call) (mediaAnchor, bool) {
 	}
 
 	mediaSess := &MediaSession{endpointLeg: leg}
-	call.mu.Lock()
-	call.media = mediaSess
-	call.releaseMedia = mediaReleaser(mediaSess, e.ports)
-	call.mu.Unlock()
+	release := mediaReleaser(mediaSess, e.ports)
+	if !call.registerMedia(func() {
+		call.media = mediaSess
+		call.releaseMedia = release
+	}) {
+		release()
+		return mediaAnchor{}, false
+	}
 
 	return mediaAnchor{session: mediaSess, securedLeg: leg}, true
 }
@@ -584,12 +594,18 @@ func (e *Engine) bridgeSecuredToPBX(ctx context.Context, call *Call, anchor medi
 	}
 
 	// Register the PBX side on the existing media session (the secured endpoint leg is
-	// already set) and extend the release hook to free the PBX pair on teardown.
+	// already set) and extend the release hook to free the PBX pair on teardown. If the
+	// call is already tearing down, its earlier hook never saw this pair/socket, so release
+	// them here rather than leak them.
 	sess := anchor.session
-	call.mu.Lock()
-	sess.pbxSide = pbxSide
-	call.releaseMedia = mediaReleaser(sess, e.ports, pbxPair)
-	call.mu.Unlock()
+	if !call.registerMedia(func() {
+		sess.pbxSide = pbxSide
+		call.releaseMedia = mediaReleaser(sess, e.ports, pbxPair)
+	}) {
+		pbxSide.close()
+		e.ports.Release(pbxPair)
+		return false
+	}
 
 	// Plain RTP/AVP offer toward the PBX: same codecs, no ICE/DTLS/rtcp-mux.
 	pbxOffer, err := buildPlainOfferFromWebRTC(call.inbound.offerSDP, e.mediaHost, pbxPair.RTP)
@@ -611,10 +627,7 @@ func (e *Engine) bridgeSecuredToPBX(ctx context.Context, call *Call, anchor medi
 		e.fail(call, 488, "Not Acceptable Here", "bad pbx answer SDP")
 		return false
 	}
-	pbxSide.setRemote(
-		&net.UDPAddr{IP: net.ParseIP(pbxHost), Port: pbxRTPPort},
-		&net.UDPAddr{IP: net.ParseIP(pbxHost), Port: pbxRTPPort + 1},
-	)
+	pbxSide.setRemote(udpAddrPair(pbxHost, pbxRTPPort))
 
 	// Both legs are now negotiated: the WebRTC endpoint answered one codec and the PBX
 	// another may differ. Surface a mismatch (logging/metric only) — the secured↔plain
@@ -776,10 +789,7 @@ func (e *Engine) dialPBX(ctx context.Context, call *Call, anchor mediaAnchor, st
 		e.fail(call, 488, "Not Acceptable Here", "bad pbx answer SDP")
 		return false
 	}
-	anchor.pbxSide.setRemote(
-		&net.UDPAddr{IP: net.ParseIP(pbxHost), Port: pbxRTPPort},
-		&net.UDPAddr{IP: net.ParseIP(pbxHost), Port: pbxRTPPort + 1},
-	)
+	anchor.pbxSide.setRemote(udpAddrPair(pbxHost, pbxRTPPort))
 
 	// Rewrite PBX answer for the endpoint: codec from PBX, address from sequencer.
 	epAnswerSDP, err := rewriteToAnchor(pbxAnswerRaw, e.mediaHost, anchor.epPair.RTP)

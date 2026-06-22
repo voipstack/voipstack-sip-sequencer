@@ -3,8 +3,16 @@ package b2bua
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
+)
+
+// SDP line prefixes the sequencer matches and emits. The sequencer is IPv4/RTP-audio
+// only (PRD §5), so these are fixed.
+const (
+	sdpAudioMedia = "m=audio "  // RTP/AVP audio media (m=) line
+	sdpConnIP4    = "c=IN IP4 " // IPv4 connection (c=) line
 )
 
 // extractAudioCodecs returns the format list from the first m=audio line plus
@@ -17,7 +25,7 @@ func extractAudioCodecs(callOffer []byte) (formats string, rtpmaps, fmtps []stri
 			if inAudio {
 				break
 			}
-			if strings.HasPrefix(line, "m=audio ") {
+			if strings.HasPrefix(line, sdpAudioMedia) {
 				inAudio = true
 				fields := strings.Fields(line)
 				if len(fields) < 4 {
@@ -85,7 +93,7 @@ func selectedAudioCodec(sdp []byte) (AudioCodec, error) {
 			if inAudio {
 				break // past the first audio block
 			}
-			if !strings.HasPrefix(line, "m=audio ") {
+			if !strings.HasPrefix(line, sdpAudioMedia) {
 				continue
 			}
 			fields := strings.Fields(line)
@@ -161,7 +169,7 @@ func codecsMatch(a, b AudioCodec) bool {
 func offerIsWebRTC(sdp []byte) bool {
 	for _, rawLine := range bytes.Split(sdp, []byte("\n")) {
 		line := strings.TrimRight(string(rawLine), "\r")
-		if strings.HasPrefix(line, "m=audio ") {
+		if strings.HasPrefix(line, sdpAudioMedia) {
 			fields := strings.Fields(line)
 			if len(fields) >= 3 {
 				proto := fields[2]
@@ -230,8 +238,8 @@ func buildTapOffer(callOffer []byte, host string, rtpPort1, rtpPort2 int) ([]byt
 	b.WriteString("t=0 0\r\n")
 
 	for _, port := range []int{rtpPort1, rtpPort2} {
-		b.WriteString("m=audio " + strconv.Itoa(port) + " RTP/AVP " + formats + "\r\n")
-		b.WriteString("c=IN IP4 " + host + "\r\n")
+		b.WriteString(sdpAudioMedia + strconv.Itoa(port) + " RTP/AVP " + formats + "\r\n")
+		b.WriteString(sdpConnIP4 + host + "\r\n")
 		for _, r := range rtpmaps {
 			b.WriteString(r + "\r\n")
 		}
@@ -258,7 +266,7 @@ func buildInactiveOffer(callOffer []byte, host string) ([]byte, error) {
 	b.WriteString("s=-\r\n")
 	b.WriteString("t=0 0\r\n")
 	b.WriteString("m=audio 0 RTP/AVP " + formats + "\r\n")
-	b.WriteString("c=IN IP4 " + host + "\r\n")
+	b.WriteString(sdpConnIP4 + host + "\r\n")
 	for _, r := range rtpmaps {
 		b.WriteString(r + "\r\n")
 	}
@@ -287,8 +295,8 @@ func buildPlainOfferFromWebRTC(webrtcOffer []byte, host string, rtpPort int) ([]
 	b.WriteString("o=- 0 0 IN IP4 " + host + "\r\n")
 	b.WriteString("s=-\r\n")
 	b.WriteString("t=0 0\r\n")
-	b.WriteString("m=audio " + strconv.Itoa(rtpPort) + " RTP/AVP " + formats + "\r\n")
-	b.WriteString("c=IN IP4 " + host + "\r\n")
+	b.WriteString(sdpAudioMedia + strconv.Itoa(rtpPort) + " RTP/AVP " + formats + "\r\n")
+	b.WriteString(sdpConnIP4 + host + "\r\n")
 	for _, r := range rtpmaps {
 		b.WriteString(r + "\r\n")
 	}
@@ -313,7 +321,7 @@ func parseTapAnswer(answer []byte) (h1 string, p1 int, h2 string, p2 int, err er
 
 	for _, rawLine := range bytes.Split(answer, []byte("\n")) {
 		line := strings.TrimRight(string(rawLine), "\r")
-		if strings.HasPrefix(line, "m=audio ") {
+		if strings.HasPrefix(line, sdpAudioMedia) {
 			fields := strings.Fields(line)
 			if len(fields) < 2 {
 				return "", 0, "", 0, fmt.Errorf("parseTapAnswer: malformed m=audio: %q", line)
@@ -324,8 +332,8 @@ func parseTapAnswer(answer []byte) (h1 string, p1 int, h2 string, p2 int, err er
 			}
 			streams = append(streams, stream{host: sessionHost, port: port})
 			cur = &streams[len(streams)-1]
-		} else if strings.HasPrefix(line, "c=IN IP4 ") {
-			addr := strings.TrimPrefix(line, "c=IN IP4 ")
+		} else if strings.HasPrefix(line, sdpConnIP4) {
+			addr := strings.TrimPrefix(line, sdpConnIP4)
 			if cur != nil {
 				cur.host = addr
 			} else {
@@ -377,7 +385,7 @@ func parseMedia(sdp []byte) (host string, rtpPort int, err error) {
 	for _, rawLine := range bytes.Split(sdp, []byte("\n")) {
 		line := strings.TrimRight(string(rawLine), "\r")
 		if strings.HasPrefix(line, "m=") {
-			inAudio = strings.HasPrefix(line, "m=audio ")
+			inAudio = strings.HasPrefix(line, sdpAudioMedia)
 			if inAudio {
 				fields := strings.Fields(line)
 				if len(fields) < 2 {
@@ -390,8 +398,8 @@ func parseMedia(sdp []byte) (host string, rtpPort int, err error) {
 				// use session host unless a media-level c= follows
 				host = sessionHost
 			}
-		} else if strings.HasPrefix(line, "c=IN IP4 ") {
-			addr := strings.TrimPrefix(line, "c=IN IP4 ")
+		} else if strings.HasPrefix(line, sdpConnIP4) {
+			addr := strings.TrimPrefix(line, sdpConnIP4)
 			if inAudio {
 				host = addr
 			} else {
@@ -408,6 +416,13 @@ func parseMedia(sdp []byte) (host string, rtpPort int, err error) {
 	}
 	if host == "" {
 		return "", 0, fmt.Errorf("parseMedia: no c= address found")
+	}
+	// The c= address must be an IP literal: the sequencer anchors and relays to a
+	// concrete IP:port and resolves nothing. An FQDN or garbage host yields a nil
+	// net.ParseIP, which downstream would wrap in a non-nil *net.UDPAddr{IP: nil} that
+	// slips past the relay's nil-address guard and silently kills that direction.
+	if net.ParseIP(host) == nil {
+		return "", 0, fmt.Errorf("parseMedia: c= address %q is not an IP literal", host)
 	}
 	return host, rtpPort, nil
 }
@@ -433,10 +448,10 @@ func rewriteToAnchor(sdp []byte, host string, rtpPort int) ([]byte, error) {
 
 		var newLine string
 		switch {
-		case strings.HasPrefix(line, "c=IN IP4 ") && !cRewritten:
-			newLine = "c=IN IP4 " + host
+		case strings.HasPrefix(line, sdpConnIP4) && !cRewritten:
+			newLine = sdpConnIP4 + host
 			cRewritten = true
-		case strings.HasPrefix(line, "m=audio ") && !audioRewritten:
+		case strings.HasPrefix(line, sdpAudioMedia) && !audioRewritten:
 			fields := strings.Fields(line)
 			if len(fields) < 2 {
 				return nil, fmt.Errorf("rewriteToAnchor: malformed m= line: %q", line)

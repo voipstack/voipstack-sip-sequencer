@@ -7,8 +7,8 @@ Let the sequencer originate SIP legs over TLS — to each `sequence` application
 transport, so TLS is a switch (TLS or plain, never both). Because sipgo binds the outbound TLS
 `*tls.Config` at the **UserAgent** level (no per-request config), build one `sipgo.UserAgent` +
 `Client` + `DialogClientCache` per distinct outbound `tls_profile`, each carrying that profile's
-client context (STORY-014, including the client certificate for mTLS and CA validation of the
-remote). Honour `connect_timeout` so a dead TLS peer fails fast instead of hanging the call. A TLS
+client context (STORY-014, including the client certificate for mTLS and — when `verify_peer` is set — validation of the
+remote (the outbound default is encrypt-only, accepting any server cert)). Honour `connect_timeout` so a dead TLS peer fails fast instead of hanging the call. A TLS
 dial failure feeds the existing per-application failure policy (skip/abort) unchanged. One profile
 reused by several endpoints reuses one certificate (loaded once). Plain legs are unchanged.
 
@@ -204,8 +204,8 @@ Notes:
      AC1 is covered by the existing `TestAppInviteUsesTCP`.)
    - `TestOutboundMutualTLSPresentsClientCert` (AC2): TLS app whose remote requires client auth →
      sequencer presents the client cert; connection accepted.
-   - `TestUntrustedRemoteRefusedThenSkip` (AC3): remote cert signed by a CA the profile does not
-     trust, app `on_failure: skip` → dial refused (never reaches the fake), call driven manually
+   - `TestUntrustedRemoteRefusedThenSkip` (AC3): with `verify_peer:true`, a remote cert signed by a
+     CA the profile does not trust, app `on_failure: skip` → dial refused (never reaches the fake), call driven manually
      (only the pbx leg answers, since the app is skipped) → caller gets 200.
    - `TestConnectTimeoutFailsFast` (AC4): `connect_timeout: 200ms` to `blackHoleAddr`, `on_failure:
      abort` → caller gets a non-200 final response well within the leg timeout, not hanging.
@@ -236,8 +236,9 @@ Notes:
 
 1. **Single-switch transport:** each app / next hop is TLS or plain by its one `transport` value —
    never both; the value alone selects the dialer (AC1).
-2. **Mutual TLS:** a TLS leg presents the profile's client certificate and validates the remote
-   against the profile CA (from `ClientConfig`, STORY-014) (AC2, AC8-equivalent).
+2. **Mutual TLS / opt-in validation:** a TLS leg always presents the profile's client certificate;
+   it validates the remote against the profile CA only when `verify_peer:true` — the outbound default
+   is encrypt-only (accepts any server cert) (from `ClientConfig`, STORY-014) (AC2).
 3. **Failure isolation:** a refused/failed TLS dial (untrusted remote, unreachable peer) is confined
    to that endpoint and resolved through the existing `on_failure` skip/abort policy — it never
    crashes or stalls the whole call (AC3, NFR).
