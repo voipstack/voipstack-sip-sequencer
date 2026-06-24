@@ -287,6 +287,13 @@ func (e *Engine) Run(ctx context.Context) error {
 	g.Go(func() error {
 		return e.srv.ListenAndServe(gctx, "udp", e.cfg.SIP.Listen)
 	})
+	// Co-bind plain TCP on the same SIP port. RFC 3261 expects a UA/proxy to listen on
+	// both UDP and TCP, and endpoints commonly register/call over TCP — a UDP-only
+	// listener silently refuses them. TCP also carries requests that exceed the UDP MTU
+	// guard, which the UDP listener would reject.
+	g.Go(func() error {
+		return e.srv.ListenAndServe(gctx, "tcp", e.cfg.SIP.Listen)
+	})
 	if e.tlsServerConf != nil {
 		g.Go(func() error {
 			return e.serveTLS(gctx, e.cfg.TLS.Listen, e.tlsServerConf)

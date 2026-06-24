@@ -252,24 +252,32 @@ func TestObservabilityServerStopsOnContextCancel(t *testing.T) {
 	listenAddr := freeAddr(t)
 	obsAddr := freeTCPAddr(t)
 
-	eng, err := New(obsConfig(listenAddr, app.sipURI(), pbx.sipURI(), obsAddr))
+	cfg := obsConfig(listenAddr, app.sipURI(), pbx.sipURI(), obsAddr)
+	eng, err := New(cfg)
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
 	}
 	eng.metrics = NewPromMetrics()
 
-	ready := make(chan struct{}, 1)
+	// Inline start (this test owns cancel to assert obs-server shutdown, so it cannot use
+	// waitEngineReady). Wait for every SIP listener — udp + tcp are co-bound on
+	// sip.listen — so the second ready signal cannot panic a single-shot close.
+	expected := expectedListeners(cfg)
+	ready := make(chan struct{}, expected)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		rctx := context.WithValue(ctx, sipgo.ListenReadyCtxKey,
-			sipgo.ListenReadyFuncCtxValue(func(_, _ string) { close(ready) }))
+			sipgo.ListenReadyFuncCtxValue(func(_, _ string) { ready <- struct{}{} }))
 		_ = eng.Run(rctx)
 	}()
-	select {
-	case <-ready:
-	case <-time.After(5 * time.Second):
-		cancel()
-		t.Fatal("engine did not start in time")
+	startDeadline := time.After(30 * time.Second)
+	for i := 0; i < expected; i++ {
+		select {
+		case <-ready:
+		case <-startDeadline:
+			cancel()
+			t.Fatal("engine did not start in time")
+		}
 	}
 
 	// Server is up.

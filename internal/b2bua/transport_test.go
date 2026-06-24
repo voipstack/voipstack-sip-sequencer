@@ -118,3 +118,48 @@ func TestAppInviteUsesTCP(t *testing.T) {
 		t.Fatalf("expected 1 active call, got %d", n)
 	}
 }
+
+// A client that registers over TCP must reach the engine. The engine co-binds a plain
+// TCP listener on sip.listen alongside UDP (RFC 3261 — a UA/proxy listens on both), so
+// the REGISTER connects over TCP and is forwarded to the registrar. Without the TCP
+// listener the dial is refused and the registration is impossible over TCP.
+func TestRegisterOverTCP(t *testing.T) {
+	registrar := newFakeRegistrar(t)
+
+	plainAddr := freeAddr(t)
+	_ = startEngine(t, testConfig(plainAddr, registrar.sipURI(), registrar.sipURI()), 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	ua, err := sipgo.NewUA()
+	if err != nil {
+		t.Fatalf("client UA: %v", err)
+	}
+	t.Cleanup(func() { _ = ua.Close() })
+	cli, err := sipgo.NewClient(ua)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+
+	var uri sip.Uri
+	if err := sip.ParseUri("sip:"+plainAddr+";transport=tcp", &uri); err != nil {
+		t.Fatalf("parse uri: %v", err)
+	}
+	req := sip.NewRequest(sip.REGISTER, uri)
+	req.AppendHeader(sip.NewHeader("Contact", "<sip:1003@example.invalid;transport=tcp>"))
+
+	// Over TCP the connection is opened on send; with no TCP listener this dial is
+	// refused and TransactionRequest errors (the reproduction of the bug).
+	regTx, err := cli.TransactionRequest(ctx, req)
+	if err != nil {
+		t.Fatalf("REGISTER over tcp: %v", err)
+	}
+	defer regTx.Terminate()
+
+	// The engine accepted the TCP connection and forwarded the REGISTER onward.
+	reg := registrar.waitRegister(t, 3*time.Second)
+	if reg.Method != sip.REGISTER {
+		t.Fatalf("registrar received %s, want REGISTER", reg.Method)
+	}
+}

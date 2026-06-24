@@ -197,17 +197,28 @@ func listenSamePort(t *testing.T) (net.PacketConn, net.Listener) {
 	return nil, nil
 }
 
-// freeAddr grabs a UDP port and releases it for the engine to bind.
-// There is a small TOCTOU race; acceptable in test contexts.
+// freeAddr grabs an ephemeral 127.0.0.1 port free for BOTH udp and tcp — the engine
+// co-binds both on sip.listen — and releases it for the engine to bind, retrying on a
+// port taken on either side. A small TOCTOU race remains; acceptable in test contexts.
 func freeAddr(t *testing.T) string {
 	t.Helper()
-	l, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("freeAddr: %v", err)
+	for attempt := 0; attempt < 20; attempt++ {
+		l, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("freeAddr udp: %v", err)
+		}
+		addr := l.LocalAddr().String()
+		tl, err := net.Listen("tcp", addr)
+		if err != nil {
+			l.Close() // tcp side busy; try a fresh port
+			continue
+		}
+		tl.Close()
+		l.Close()
+		return addr
 	}
-	addr := l.LocalAddr().String()
-	l.Close()
-	return addr
+	t.Fatal("freeAddr: no free udp+tcp port after 20 attempts")
+	return ""
 }
 
 // waitNoActiveCalls polls until the engine's call registry is empty, failing if it is
@@ -259,28 +270,55 @@ func startEngine(t *testing.T, cfg config.Config, legTimeout time.Duration, sink
 		eng.metrics = sinks[0]
 	}
 
-	ready := make(chan struct{}, 1)
+	waitEngineReady(t, eng, cfg)
+	return eng
+}
+
+// expectedListeners is how many ListenAndServe ready callbacks the engine fires for cfg.
+// udp + tcp are always co-bound on sip.listen; ws/wss are optional and each fire it.
+// tls.listen uses a separate serveTLS path that does NOT fire the callback (its
+// readiness is checked with waitPortOpen), so it is not counted here.
+func expectedListeners(cfg config.Config) int {
+	n := 2 // udp + tcp on sip.listen
+	if cfg.WS.Listen != "" {
+		n++
+	}
+	if cfg.WSS.Listen != "" {
+		n++
+	}
+	return n
+}
+
+// waitEngineReady runs eng and blocks until every ListenAndServe listener has fired its
+// ready callback (one per listener), registering Cleanup. Waiting for all of them — not
+// just the first — keeps Cleanup's cancel from racing a listener still storing its closer
+// inside sipgo, and ensures co-bound transports (e.g. tcp) are actually bound.
+func waitEngineReady(t *testing.T, eng *Engine, cfg config.Config) {
+	t.Helper()
+	expected := expectedListeners(cfg)
+	ready := make(chan struct{}, expected)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
 		rctx := context.WithValue(ctx, sipgo.ListenReadyCtxKey,
-			sipgo.ListenReadyFuncCtxValue(func(_, _ string) { close(ready) }))
+			sipgo.ListenReadyFuncCtxValue(func(_, _ string) { ready <- struct{}{} }))
 		_ = eng.Run(rctx)
 	}()
 
-	select {
-	case <-ready:
-	case <-time.After(30 * time.Second):
-		cancel()
-		t.Fatal("engine did not start in time")
+	deadline := time.After(30 * time.Second)
+	for i := 0; i < expected; i++ {
+		select {
+		case <-ready:
+		case <-deadline:
+			cancel()
+			t.Fatal("engine did not start in time")
+		}
 	}
 
 	t.Cleanup(func() {
 		cancel()
 		_ = eng.Shutdown()
 	})
-
-	return eng
 }
 
 // waitDialogEnd blocks until the dialog transitions to DialogStateEnded or times out.

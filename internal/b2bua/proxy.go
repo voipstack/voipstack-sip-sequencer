@@ -1,7 +1,6 @@
 package b2bua
 
 import (
-	"fmt"
 	"log/slog"
 	"strings"
 
@@ -70,7 +69,7 @@ func (e *Engine) forwardAndRelay(req *sip.Request, tx sip.ServerTransaction, des
 	ctx := e.runCtx
 	clientTx, err := e.cli.TransactionRequest(ctx, fwd, sipgo.ClientRequestAddVia)
 	if err != nil {
-		slog.Error(fmt.Sprintf("proxy %s to %q: %v", req.Method, destination, err))
+		logForwardError(destination, fwd, err)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, onSendErr.code, onSendErr.reason, nil))
 		return
 	}
@@ -152,8 +151,19 @@ func buildForward(req *sip.Request, destination, transport string, prepare ...fu
 func (e *Engine) forwardStateless(req *sip.Request, destination, transport string, prepare ...func(*sip.Request)) {
 	fwd := buildForward(req, destination, transport, prepare...)
 	if err := e.cli.WriteRequest(fwd, sipgo.ClientRequestAddVia); err != nil {
-		slog.Error(fmt.Sprintf("proxy %s to %q: %v", req.Method, destination, err))
+		logForwardError(destination, fwd, err)
 	}
+}
+
+// logForwardError logs a failed forward together with the full SIP message that could
+// not be sent and its byte size — so a transport failure such as an over-MTU UDP write
+// ("size of packet larger than MTU") is diagnosable from the actual on-wire bytes, not
+// just the error string. sipgo has already applied the proxy Via to fwd by the time the
+// write fails, so the dump reflects what it tried to put on the wire.
+func logForwardError(destination string, fwd *sip.Request, err error) {
+	raw := fwd.String()
+	slog.Error("proxy forward failed",
+		"method", fwd.Method, "dest", destination, "bytes", len(raw), "err", err, "raw", raw)
 }
 
 // routeToFlow handles a request whose top Route is this sequencer's Path carrying a

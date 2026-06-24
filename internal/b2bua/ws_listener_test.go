@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emiago/sipgo"
 	"github.com/gobwas/ws"
 
 	"github.com/voipstack/voipstack-sip-sequencer/internal/config"
@@ -46,42 +45,7 @@ func startEngineWS(t *testing.T, cfg config.Config) *Engine {
 		t.Fatalf("new engine: %v", err)
 	}
 
-	// Every sipgo ListenAndServe[TLS] listener fires the ready callback once after it
-	// has stored its own listener closer. The UDP, WS, and WSS listeners all use that
-	// path, so wait for one signal per listener before returning: that way Cleanup's
-	// cancel can never race a listener still writing its closer inside sipgo.
-	expected := 1 // udp
-	if cfg.WS.Listen != "" {
-		expected++
-	}
-	if cfg.WSS.Listen != "" {
-		expected++
-	}
-	ready := make(chan struct{}, expected)
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		rctx := context.WithValue(ctx, sipgo.ListenReadyCtxKey,
-			sipgo.ListenReadyFuncCtxValue(func(_, _ string) { ready <- struct{}{} }))
-		_ = eng.Run(rctx)
-	}()
-
-	// Generous: the success path fires on the ready signal immediately, so this only
-	// bounds a genuine startup failure. 5s was too tight under -race + full-suite load,
-	// where a spurious timeout also raced cancel() against sipgo's listener startup.
-	deadline := time.After(30 * time.Second)
-	for i := 0; i < expected; i++ {
-		select {
-		case <-ready:
-		case <-deadline:
-			cancel()
-			t.Fatal("engine did not start in time")
-		}
-	}
-
-	t.Cleanup(func() {
-		cancel()
-		_ = eng.Shutdown()
-	})
+	waitEngineReady(t, eng, cfg)
 	return eng
 }
 
