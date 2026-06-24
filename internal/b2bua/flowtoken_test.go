@@ -1,32 +1,60 @@
 package b2bua
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
 
-// Given a Flow and a secret; When minted then parsed with the same secret;
-// Then the original Flow is recovered.
+// Given a Flow; When packed into a token then parsed; Then the original Flow is
+// recovered — across every transport and both IPv4 and IPv6.
 func TestFlowTokenRoundTrips(t *testing.T) {
-	secret := []byte("test-secret-0123456789abcdef")
-	in := Flow{Addr: "203.0.113.7:51234", Transport: "ws"}
-
-	token := mintFlowToken(in, secret)
-	out, err := parseFlowToken(token, secret)
-	if err != nil {
-		t.Fatalf("parseFlowToken: %v", err)
+	cases := []Flow{
+		{Addr: "203.0.113.7:51234", Transport: "ws"},
+		{Addr: "192.168.56.1:5064", Transport: "udp"},
+		{Addr: "10.0.0.1:5060", Transport: "tcp"},
+		{Addr: "10.0.0.2:5061", Transport: "tls"},
+		{Addr: "[2001:db8::1]:5060", Transport: "wss"},
 	}
-	if out != in {
-		t.Fatalf("round-trip mismatch: got %+v, want %+v", out, in)
+	for _, in := range cases {
+		token, err := mintFlowToken(in)
+		if err != nil {
+			t.Fatalf("mintFlowToken(%+v): %v", in, err)
+		}
+		out, err := parseFlowToken(token)
+		if err != nil {
+			t.Fatalf("parseFlowToken(%q): %v", token, err)
+		}
+		if out != in {
+			t.Fatalf("round-trip mismatch: got %+v, want %+v", out, in)
+		}
 	}
 }
 
-// The token must be safe to carry as a SIP URI user-part: base64url payload and mac
-// joined by a dot, no characters that would break URI parsing.
+// The transport is canonicalized to lower case (sipgo reports it upper case), so a
+// minted "UDP" flow parses back as "udp".
+func TestFlowTokenNormalizesTransportCase(t *testing.T) {
+	token, err := mintFlowToken(Flow{Addr: "10.0.0.1:5060", Transport: "UDP"})
+	if err != nil {
+		t.Fatalf("mintFlowToken: %v", err)
+	}
+	out, err := parseFlowToken(token)
+	if err != nil {
+		t.Fatalf("parseFlowToken: %v", err)
+	}
+	if out.Transport != "udp" {
+		t.Fatalf("transport = %q, want udp", out.Transport)
+	}
+}
+
+// The token must be safe to carry as a SIP URI user-part: a single base64url blob with
+// no characters that would break URI parsing.
 func TestFlowTokenIsURISafe(t *testing.T) {
-	secret := []byte("secret")
-	token := mintFlowToken(Flow{Addr: "[2001:db8::1]:5060", Transport: "wss"}, secret)
-	const allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+	token, err := mintFlowToken(Flow{Addr: "[2001:db8::1]:5060", Transport: "wss"})
+	if err != nil {
+		t.Fatalf("mintFlowToken: %v", err)
+	}
+	const allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 	for _, r := range token {
 		if !strings.ContainsRune(allowed, r) {
 			t.Fatalf("token contains URI-unsafe rune %q in %q", r, token)
@@ -34,60 +62,37 @@ func TestFlowTokenIsURISafe(t *testing.T) {
 	}
 }
 
-// Given a token; When its payload is tampered; Then parse fails (MAC no longer matches).
-func TestFlowTokenTamperedPayloadFails(t *testing.T) {
-	secret := []byte("secret")
-	token := mintFlowToken(Flow{Addr: "10.0.0.1:5060", Transport: "ws"}, secret)
-
-	payload, mac, _ := strings.Cut(token, ".")
-	// Flip a byte in the payload while keeping it valid base64url.
-	b := []byte(payload)
-	if b[0] == 'A' {
-		b[0] = 'B'
-	} else {
-		b[0] = 'A'
+// The whole point of the binary packing: an IPv4 flow token is tiny (7-byte blob → 10
+// base64url chars). Lock that in so a future change cannot silently re-inflate it.
+func TestFlowTokenIsCompact(t *testing.T) {
+	token, err := mintFlowToken(Flow{Addr: "192.168.56.1:5064", Transport: "udp"})
+	if err != nil {
+		t.Fatalf("mintFlowToken: %v", err)
 	}
-	tampered := string(b) + "." + mac
-
-	if _, err := parseFlowToken(tampered, secret); err == nil {
-		t.Fatal("expected error for tampered payload, got nil")
+	if len(token) > 12 {
+		t.Fatalf("ipv4 token = %d chars (%q), want <= 12", len(token), token)
 	}
 }
 
-// Given a token; When its MAC is tampered; Then parse fails.
-func TestFlowTokenTamperedMACFails(t *testing.T) {
-	secret := []byte("secret")
-	token := mintFlowToken(Flow{Addr: "10.0.0.1:5060", Transport: "ws"}, secret)
-
-	payload, mac, _ := strings.Cut(token, ".")
-	b := []byte(mac)
-	if b[len(b)-1] == 'A' {
-		b[len(b)-1] = 'B'
-	} else {
-		b[len(b)-1] = 'A'
-	}
-	tampered := payload + "." + string(b)
-
-	if _, err := parseFlowToken(tampered, secret); err == nil {
-		t.Fatal("expected error for tampered mac, got nil")
-	}
-}
-
-// Given a token minted with one secret; When parsed with a different secret;
-// Then parse fails — a foreign-signed token never yields a Flow.
-func TestFlowTokenForeignSecretFails(t *testing.T) {
-	token := mintFlowToken(Flow{Addr: "10.0.0.1:5060", Transport: "ws"}, []byte("secret-A"))
-	if _, err := parseFlowToken(token, []byte("secret-B")); err == nil {
-		t.Fatal("expected error for foreign secret, got nil")
-	}
-}
-
-// Malformed input must be rejected with an error, never a panic.
+// Malformed input must be rejected with an error (never a Flow, never a panic): bad
+// base64, a valid-base64 blob of the wrong length, and a well-sized blob whose
+// transport byte is out of range.
 func TestFlowTokenMalformedRejected(t *testing.T) {
-	secret := []byte("secret")
-	for _, tok := range []string{"", "no-dot", ".", "a.b.c", "$$$.$$$", "validlooking."} {
-		if _, err := parseFlowToken(tok, secret); err == nil {
+	badCode := base64.RawURLEncoding.EncodeToString([]byte{9, 1, 2, 3, 4, 5, 6}) // 7 bytes, code 9
+	for _, tok := range []string{"", "!!!", "AAAA", badCode} {
+		if _, err := parseFlowToken(tok); err == nil {
 			t.Fatalf("expected error for malformed token %q, got nil", tok)
 		}
+	}
+}
+
+// A flow the token cannot represent (unknown transport, or a host that is not an IP)
+// must fail at mint rather than emit a token that will not parse.
+func TestFlowTokenMintRejectsUnencodableFlow(t *testing.T) {
+	if _, err := mintFlowToken(Flow{Addr: "10.0.0.1:5060", Transport: "sctp"}); err == nil {
+		t.Fatal("expected error for unknown transport, got nil")
+	}
+	if _, err := mintFlowToken(Flow{Addr: "example.com:5060", Transport: "udp"}); err == nil {
+		t.Fatal("expected error for non-IP host, got nil")
 	}
 }

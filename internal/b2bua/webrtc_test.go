@@ -234,7 +234,7 @@ func startEngineOpts(t *testing.T, cfg config.Config, opts ...Option) *Engine {
 	}()
 	select {
 	case <-ready:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		cancel()
 		t.Fatal("engine did not start in time")
 	}

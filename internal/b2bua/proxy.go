@@ -58,37 +58,13 @@ func (e *Engine) forwardAndRelay(req *sip.Request, tx sip.ServerTransaction, des
 	}
 
 	// Reject loops: Max-Forwards: 0 → 483.
-	origMF := req.MaxForwards()
-	if origMF != nil && origMF.Val() == 0 {
+	if origMF := req.MaxForwards(); origMF != nil && origMF.Val() == 0 {
 		slog.Info("proxy rejected: max-forwards exhausted", append([]any{"method", req.Method}, cidArgs...)...)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 483, "Too Many Hops", nil))
 		return
 	}
 
-	// Clone so ClientRequestAddVia and the prepare hooks do not mutate the inbound request.
-	fwd := req.Clone()
-	fwd.SetBody(req.Body())
-
-	// Decrement Max-Forwards on the clone (or set 70 if absent).
-	fwd.RemoveHeader("Max-Forwards")
-	newMF := sip.MaxForwardsHeader(70)
-	if origMF != nil {
-		newMF = sip.MaxForwardsHeader(origMF.Val() - 1)
-	}
-	fwd.AppendHeader(&newMF)
-
-	for _, p := range prepare {
-		p(fwd)
-	}
-
-	// Force the outbound transport to the destination's, independent of the transport
-	// the request arrived on — otherwise a ws-inbound REGISTER/INVITE would leak
-	// transport=ws onto a UDP/TCP next-hop and mis-dial.
-	if transport != "" {
-		fwd.Recipient = withTransport(fwd.Recipient, transport)
-		fwd.SetTransport(strings.ToUpper(transport))
-	}
-	fwd.SetDestination(destination)
+	fwd := buildForward(req, destination, transport, prepare...)
 
 	// Forward; sipgo prepends a proxy Via via ClientRequestAddVia.
 	ctx := e.runCtx
@@ -138,13 +114,64 @@ func (e *Engine) forwardAndRelay(req *sip.Request, tx sip.ServerTransaction, des
 	}
 }
 
-// routeToFlow recognizes an inbound request whose top Route is this sequencer's Path
-// carrying a valid flow token, pops that Route, and forwards the request to the
-// webphone's recorded flow address — letting sipgo's connection reuse deliver it over
-// the existing WebSocket. It returns false when the request is not a self-Route flow
-// request (no Route, a foreign host, or a token that fails MAC verification), so
-// normal handling proceeds. It forwards only to an address recovered from a verified
-// token; a dropped flow yields 480 (no new connection is dialed).
+// buildForward clones req for proxying to destination over transport. It copies the
+// body, decrements Max-Forwards (RFC 3261 §16.6, defaulting to 70 when absent), runs
+// the prepare hooks (insert a Path/Record-Route, pop a self-Route), forces the
+// outbound transport, and pins the destination. It does not send — both the
+// transaction (forwardAndRelay) and stateless (forwardStateless) forward paths build
+// their clone here so the two share one definition of "a forwarded request".
+func buildForward(req *sip.Request, destination, transport string, prepare ...func(*sip.Request)) *sip.Request {
+	fwd := req.Clone()
+	fwd.SetBody(req.Body())
+
+	fwd.RemoveHeader("Max-Forwards")
+	newMF := sip.MaxForwardsHeader(70)
+	if origMF := req.MaxForwards(); origMF != nil {
+		newMF = sip.MaxForwardsHeader(origMF.Val() - 1)
+	}
+	fwd.AppendHeader(&newMF)
+
+	for _, p := range prepare {
+		p(fwd)
+	}
+
+	// Force the outbound transport to the destination's, independent of the transport
+	// the request arrived on — otherwise a ws-inbound REGISTER/INVITE would leak
+	// transport=ws onto a UDP/TCP next-hop and mis-dial.
+	if transport != "" {
+		fwd.Recipient = withTransport(fwd.Recipient, transport)
+		fwd.SetTransport(strings.ToUpper(transport))
+	}
+	fwd.SetDestination(destination)
+	return fwd
+}
+
+// forwardStateless forwards an ACK for a 2xx. An ACK is a standalone message with no
+// response, so it cannot ride forwardAndRelay's request/response loop: the proxy
+// writes it on and is done. sipgo prepends the proxy Via via ClientRequestAddVia.
+func (e *Engine) forwardStateless(req *sip.Request, destination, transport string, prepare ...func(*sip.Request)) {
+	fwd := buildForward(req, destination, transport, prepare...)
+	if err := e.cli.WriteRequest(fwd, sipgo.ClientRequestAddVia); err != nil {
+		slog.Error(fmt.Sprintf("proxy %s to %q: %v", req.Method, destination, err))
+	}
+}
+
+// routeToFlow handles a request whose top Route is this sequencer's Path carrying a
+// valid flow token. It pops that self-Route and proxies the request along the
+// webphone's flow — letting sipgo's connection reuse deliver it over the existing
+// WebSocket — so an inbound call and its in-dialog follow-ups (ACK, BYE, re-INVITE)
+// all reach a webphone whose own Contact is unroutable.
+//
+// To stay in that dialog path, the initial INVITE toward the phone is Record-Routed
+// with the same self-Route value, so the caller addresses every later in-dialog
+// request back through here. A request arriving *from* the flow is the phone
+// answering in-dialog (e.g. its own BYE): that one is proxied outward toward its
+// Request-URI, not looped back onto the flow.
+//
+// It returns false when the request is not a self-Route flow request (no Route, a
+// foreign host, or a token that fails to decode) so normal handling proceeds; it
+// forwards only to an address recovered from the token, and a dropped flow yields 480
+// (no new connection is dialed).
 func (e *Engine) routeToFlow(req *sip.Request, tx sip.ServerTransaction) bool {
 	top := req.GetHeader("Route")
 	if top == nil {
@@ -158,27 +185,47 @@ func (e *Engine) routeToFlow(req *sip.Request, tx sip.ServerTransaction) bool {
 		return false
 	}
 
-	flow, err := parseFlowToken(rh.Address.User, e.flowSecret)
+	flow, err := parseFlowToken(rh.Address.User)
 	if err != nil {
-		// Forged or foreign token: never forward to an unverified address.
+		// Malformed token: never forward to an address we could not decode.
 		slog.Warn("flow route rejected: invalid token", "host", rh.Address.HostPort())
 		return false
 	}
 
+	selfRoute := rh.Clone()
+
 	// Pop the top Route (self-route removal, RFC 3261 §16.6) on the forwarded clone,
 	// preserving any remaining Route headers.
-	popTopRoute := func(fwd *sip.Request) {
+	prepare := []func(*sip.Request){func(fwd *sip.Request) {
 		routes := fwd.GetHeaders("Route")
 		fwd.RemoveHeader("Route")
 		for _, r := range routes[1:] {
 			fwd.AppendHeader(r)
 		}
+	}}
+
+	// Direction: a request that arrived over the phone's own flow is the phone speaking
+	// in-dialog, so it travels outward to its Request-URI; anything else is bound for
+	// the phone and travels onto the flow.
+	destination, transport := flow.Addr, strings.ToLower(flow.Transport)
+	if req.Source() == flow.Addr {
+		destination, transport = req.Recipient.HostPort(), ""
+	} else if req.IsInvite() {
+		// Keep the sequencer in the dialog so the caller's later in-dialog requests
+		// return here — the phone's Contact is unroutable, so this is the only way the
+		// dialog can continue. Reuse the consumed self-Route as the Record-Route.
+		rr := &sip.RecordRouteHeader{Address: *selfRoute.Address.Clone()}
+		prepare = append(prepare, func(fwd *sip.Request) { fwd.PrependHeader(rr) })
 	}
 
-	slog.Info("flow route forwarding", "method", req.Method, "callID", callIDValue(req), "flow", flow.Addr)
-	e.forwardAndRelay(req, tx, flow.Addr, strings.ToLower(flow.Transport),
+	slog.Info("flow route forwarding", "method", req.Method, "callID", callIDValue(req), "dest", destination)
+	if req.IsAck() {
+		e.forwardStateless(req, destination, transport, prepare...)
+		return true
+	}
+	e.forwardAndRelay(req, tx, destination, transport,
 		proxyFault{480, "Temporarily Unavailable"}, proxyFault{480, "Temporarily Unavailable"},
-		popTopRoute)
+		prepare...)
 	return true
 }
 

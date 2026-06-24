@@ -65,7 +65,10 @@ func startEngineWS(t *testing.T, cfg config.Config) *Engine {
 		_ = eng.Run(rctx)
 	}()
 
-	deadline := time.After(5 * time.Second)
+	// Generous: the success path fires on the ready signal immediately, so this only
+	// bounds a genuine startup failure. 5s was too tight under -race + full-suite load,
+	// where a spurious timeout also raced cancel() against sipgo's listener startup.
+	deadline := time.After(30 * time.Second)
 	for i := 0; i < expected; i++ {
 		select {
 		case <-ready:

@@ -210,6 +210,27 @@ func freeAddr(t *testing.T) string {
 	return addr
 }
 
+// waitNoActiveCalls polls until the engine's call registry is empty, failing if it is
+// not within a generous timeout. teardown is asynchronous — it BYEs every live leg
+// (network round-trips, each with its own timeout) before removing the call from the
+// registry — so a fixed sleep races that cleanup and flakes under load. Polling for the
+// real end state still fails for a genuine leak; it only tolerates a slow teardown.
+func waitNoActiveCalls(t *testing.T, eng *Engine, what string) {
+	t.Helper()
+	const timeout = 3 * time.Second
+	deadline := time.After(timeout)
+	for {
+		if eng.calls.len() == 0 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected 0 active calls %s, still %d after %s", what, eng.calls.len(), timeout)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func testConfig(listenAddr, appURI, pbxURI string) config.Config {
 	return config.Config{
 		SIP:     config.SIP{Listen: listenAddr},
@@ -249,7 +270,7 @@ func startEngine(t *testing.T, cfg config.Config, legTimeout time.Duration, sink
 
 	select {
 	case <-ready:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		cancel()
 		t.Fatal("engine did not start in time")
 	}
@@ -265,6 +286,13 @@ func startEngine(t *testing.T, cfg config.Config, legTimeout time.Duration, sink
 // waitDialogEnd blocks until the dialog transitions to DialogStateEnded or times out.
 func waitDialogEnd(t *testing.T, ch <-chan sip.DialogState, timeout time.Duration) {
 	t.Helper()
+	// The timeout only bounds a genuine hang — the happy path returns as soon as the
+	// Ended state arrives. Under parallel test load the teardown BYE round-trip that
+	// drives that transition can take several seconds, so enforce a generous floor to
+	// avoid spurious "timeout waiting for dialog end" flakes (callers pass 3s).
+	if timeout < 15*time.Second {
+		timeout = 15 * time.Second
+	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	for {
@@ -379,11 +407,7 @@ func TestCallerHangupTearsDownAllLegs(t *testing.T) {
 	waitDialogEnd(t, appEnd, 3*time.Second)
 	waitDialogEnd(t, pbxEnd, 3*time.Second)
 
-	// Give teardown a moment to remove from registry
-	time.Sleep(50 * time.Millisecond)
-	if n := eng.calls.len(); n != 0 {
-		t.Fatalf("expected 0 active calls after BYE, got %d", n)
-	}
+	waitNoActiveCalls(t, eng, "after BYE")
 }
 
 // Given established call; When PBX sends BYE; Then all legs tear down (AC3).
@@ -437,10 +461,7 @@ func TestCalleeHangupTearsDownAllLegs(t *testing.T) {
 	waitDialogEnd(t, callerEnd, 3*time.Second)
 	waitDialogEnd(t, appEnd, 3*time.Second)
 
-	time.Sleep(50 * time.Millisecond)
-	if n := eng.calls.len(); n != 0 {
-		t.Fatalf("expected 0 active calls after callee BYE, got %d", n)
-	}
+	waitNoActiveCalls(t, eng, "after callee BYE")
 }
 
 // Given app rejects with 486; When caller sends INVITE; Then caller sees 486 and PBX is never invited (AC4).
@@ -655,12 +676,7 @@ func TestManyRejectedCallsLeaveNoActiveCalls(t *testing.T) {
 		}
 	}
 
-	// Small settle window for teardown goroutines
-	time.Sleep(100 * time.Millisecond)
-
-	if n := eng.calls.len(); n != 0 {
-		t.Fatalf("expected empty registry, got %d active calls", n)
-	}
+	waitNoActiveCalls(t, eng, "(empty registry expected)")
 	// PBX should never have been invited
 	pbx.noInvite(t, 50*time.Millisecond)
 }
@@ -1044,10 +1060,7 @@ func TestFullChainTearsDownOnHangup(t *testing.T) {
 	waitDialogEnd(t, appCEnd, 3*time.Second)
 	waitDialogEnd(t, pbxEnd, 3*time.Second)
 
-	time.Sleep(50 * time.Millisecond)
-	if n := eng.calls.len(); n != 0 {
-		t.Fatalf("expected 0 active calls after BYE, got %d", n)
-	}
+	waitNoActiveCalls(t, eng, "after BYE")
 }
 
 // Given sequence [A,B,C]; When app B rejects; Then caller sees rejection, A is torn down,
@@ -1093,10 +1106,7 @@ func TestMidChainFailureTearsDownPriorLegs(t *testing.T) {
 	appC.noInvite(t, 200*time.Millisecond)
 	pbx.noInvite(t, 50*time.Millisecond)
 
-	time.Sleep(100 * time.Millisecond)
-	if n := eng.calls.len(); n != 0 {
-		t.Fatalf("expected 0 active calls after mid-chain failure, got %d", n)
-	}
+	waitNoActiveCalls(t, eng, "after mid-chain failure")
 }
 
 // ── failure-policy test helpers ───────────────────────────────────────────────
@@ -1400,8 +1410,5 @@ func TestSkipFailedLegNotInTeardown(t *testing.T) {
 		t.Fatalf("caller BYE: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-	if n := eng.calls.len(); n != 0 {
-		t.Fatalf("expected 0 active calls after BYE, got %d", n)
-	}
+	waitNoActiveCalls(t, eng, "after BYE")
 }

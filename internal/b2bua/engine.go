@@ -2,7 +2,6 @@ package b2bua
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -47,7 +46,6 @@ type Engine struct {
 	webrtcFactory   WebRTCFactory
 	obsListen       string
 	obsServer       *http.Server
-	flowSecret      []byte
 	pathHost        string
 	pathPort        int
 }
@@ -106,14 +104,6 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 		return nil, fmt.Errorf("create SIP client: %w", err)
 	}
 
-	// flowSecret signs the Path flow token (RFC 3327). It lives for the process only:
-	// a restart invalidates outstanding tokens, and webphones re-register for a fresh
-	// Path. It is never logged.
-	flowSecret := make([]byte, 32)
-	if _, err := rand.Read(flowSecret); err != nil {
-		return nil, fmt.Errorf("generate flow secret: %w", err)
-	}
-
 	contactHDR := sip.ContactHeader{
 		Address: sip.Uri{Host: host, Port: port},
 	}
@@ -149,7 +139,6 @@ func New(cfg config.Config, opts ...Option) (*Engine, error) {
 		mediaPublicAddr: mediaPublicAddr,
 		webrtcFactory:   pionFactory{},
 		obsListen:       cfg.Observability.Listen,
-		flowSecret:      flowSecret,
 		pathHost:        host,
 		pathPort:        port,
 	}
@@ -249,9 +238,19 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	e.srv.OnInvite(e.handleInvite)
 	e.srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) {
+		// An in-dialog ACK whose top Route is our flow Path is proxied over the flow,
+		// not consumed as a local dialog ACK.
+		if e.routeToFlow(req, tx) {
+			return
+		}
 		_ = e.dialogSrvCache.ReadAck(req, tx)
 	})
 	e.srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
+		// Likewise a BYE riding our flow Path is proxied along the flow rather than
+		// matched to a local dialog.
+		if e.routeToFlow(req, tx) {
+			return
+		}
 		if err := e.dialogSrvCache.ReadBye(req, tx); err == nil {
 			return
 		}

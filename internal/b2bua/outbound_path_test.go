@@ -3,7 +3,6 @@ package b2bua
 import (
 	"context"
 	"net"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +119,8 @@ type wsPhone struct {
 	cli     *sipgo.Client
 	target  string
 	invites chan *sip.Request
+	acks    chan *sip.Request
+	byes    chan *sip.Request
 }
 
 func newWSPhone(t *testing.T, engineWSAddr string) *wsPhone {
@@ -143,6 +144,8 @@ func newWSPhone(t *testing.T, engineWSAddr string) *wsPhone {
 		cli:     cli,
 		target:  "sip:" + engineWSAddr + ";transport=ws",
 		invites: make(chan *sip.Request, 4),
+		acks:    make(chan *sip.Request, 4),
+		byes:    make(chan *sip.Request, 4),
 	}
 
 	srv.OnInvite(func(req *sip.Request, tx sip.ServerTransaction) {
@@ -150,8 +153,9 @@ func newWSPhone(t *testing.T, engineWSAddr string) *wsPhone {
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 180, "Ringing", nil))
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", []byte(testSDP2)))
 	})
-	srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) {})
+	srv.OnAck(func(req *sip.Request, tx sip.ServerTransaction) { p.acks <- req.Clone() })
 	srv.OnBye(func(req *sip.Request, tx sip.ServerTransaction) {
+		p.byes <- req.Clone()
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 	})
 
@@ -216,6 +220,28 @@ func (p *wsPhone) noInvite(t *testing.T, window time.Duration) {
 	}
 }
 
+func (p *wsPhone) waitAck(t *testing.T, timeout time.Duration) *sip.Request {
+	t.Helper()
+	select {
+	case req := <-p.acks:
+		return req
+	case <-time.After(timeout):
+		t.Fatal("phone: timeout waiting for in-dialog ACK")
+		return nil
+	}
+}
+
+func (p *wsPhone) waitBye(t *testing.T, timeout time.Duration) *sip.Request {
+	t.Helper()
+	select {
+	case req := <-p.byes:
+		return req
+	case <-time.After(timeout):
+		t.Fatal("phone: timeout waiting for in-dialog BYE")
+		return nil
+	}
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────────
 
 // pathOf returns the Path header value of a captured request, failing if absent.
@@ -267,7 +293,7 @@ func TestRegisterInsertsPathAndForwards(t *testing.T) {
 	if pathURI.Host != eng.pathHost || pathURI.Port != eng.pathPort {
 		t.Fatalf("Path host = %s:%d, want %s:%d", pathURI.Host, pathURI.Port, eng.pathHost, eng.pathPort)
 	}
-	flow, err := parseFlowToken(pathURI.User, eng.flowSecret)
+	flow, err := parseFlowToken(pathURI.User)
 	if err != nil {
 		t.Fatalf("Path token does not verify: %v", err)
 	}
@@ -320,6 +346,53 @@ func TestInboundInviteRoutedBackOverFlow(t *testing.T) {
 	}
 }
 
+// An inbound call routed to a registered webphone must be completable end to end: the
+// caller's in-dialog ACK and BYE have to reach the phone over its flow. The phone's
+// Contact is non-routable (the flow is the only path back), so the sequencer must stay
+// in the dialog path — without a Record-Route the caller would address the ACK/BYE to
+// that dead Contact and the call would ring but never complete or tear down.
+func TestInboundCallToWebphoneCompletesInDialog(t *testing.T) {
+	app := newFakeUASTCP(t)
+	registrar := newFakeRegistrar(t)
+
+	plainAddr := freeAddr(t)
+	wsAddr := freeAddr(t)
+	_ = startEngineWS(t, wsConfig(plainAddr, wsAddr, app.sipURI(), registrar.sipURI()))
+
+	phone := newWSPhone(t, wsAddr)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	phone.register(t, ctx)
+
+	reg := registrar.waitRegister(t, 3*time.Second)
+	pathValue := pathOf(t, reg)
+
+	// The caller dials the sequencer with Route = the recorded Path; the engine routes
+	// it onto the phone's flow.
+	caller := newFakeUAC(t)
+	sess, err := caller.dcc.Invite(ctx, mustURI(t, "sip:"+plainAddr), []byte(testSDP),
+		sip.NewHeader("Route", pathValue))
+	if err != nil {
+		t.Fatalf("caller invite: %v", err)
+	}
+	if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
+		t.Fatalf("caller WaitAnswer: %v", err)
+	}
+	phone.waitInvite(t, 3*time.Second)
+
+	// The ACK for the 200 must reach the phone over its flow.
+	if err := sess.Ack(ctx); err != nil {
+		t.Fatalf("caller Ack: %v", err)
+	}
+	phone.waitAck(t, 3*time.Second)
+
+	// And so must the BYE that tears the call down.
+	if err := sess.Bye(ctx); err != nil {
+		t.Fatalf("caller Bye: %v", err)
+	}
+	phone.waitBye(t, 3*time.Second)
+}
+
 // AC3: a second request from the same registered client rides the same ws connection.
 // The sequencer observes the same source address for both REGISTERs — i.e. one flow,
 // one connection reused — so both Paths decode to the same flow.
@@ -329,7 +402,7 @@ func TestSubsequentRequestsReuseFlow(t *testing.T) {
 
 	plainAddr := freeAddr(t)
 	wsAddr := freeAddr(t)
-	eng := startEngineWS(t, wsConfig(plainAddr, wsAddr, app.sipURI(), registrar.sipURI()))
+	_ = startEngineWS(t, wsConfig(plainAddr, wsAddr, app.sipURI(), registrar.sipURI()))
 
 	phone := newWSPhone(t, wsAddr)
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
@@ -342,11 +415,11 @@ func TestSubsequentRequestsReuseFlow(t *testing.T) {
 	phone.register(t, ctx)
 	second := angleURI(t, pathOf(t, registrar.waitRegister(t, 3*time.Second)))
 
-	flow1, err := parseFlowToken(first.User, eng.flowSecret)
+	flow1, err := parseFlowToken(first.User)
 	if err != nil {
 		t.Fatalf("first Path token: %v", err)
 	}
-	flow2, err := parseFlowToken(second.User, eng.flowSecret)
+	flow2, err := parseFlowToken(second.User)
 	if err != nil {
 		t.Fatalf("second Path token: %v", err)
 	}
@@ -399,44 +472,11 @@ func TestReRegisterUpdatesFlow(t *testing.T) {
 	phone2.noInvite(t, 300*time.Millisecond)
 }
 
-// Security: an INVITE with a self-host Route whose token fails the MAC is never
-// forwarded to the address the token would imply (no SSRF); the request falls through
-// to normal handling and a final response is returned.
-func TestForgedRouteNotForwarded(t *testing.T) {
-	app := newFakeUAS(t)
-	pbx := newFakeUAS(t)
-	sentinel := newFakeUAS(t)
-	caller := newFakeUAC(t)
-
-	plainAddr := freeAddr(t)
-	wsAddr := freeAddr(t)
-	eng := startEngineWS(t, wsConfig(plainAddr, wsAddr, app.sipURI(), pbx.sipURI()))
-
-	// Normal bridge can complete so the forged-route INVITE gets a clean final response.
-	autoAnswer(t, app, "", nil)
-	autoAnswer(t, pbx, "", nil)
-
-	// A token that decodes (only if the MAC were ignored) to the sentinel address, but
-	// signed with the WRONG secret — so the sequencer must reject it.
-	forged := mintFlowToken(Flow{Addr: sentinel.addr, Transport: "udp"}, []byte("attacker-secret"))
-	route := "<sip:" + forged + "@" + eng.pathHost + ":" + strconv.Itoa(eng.pathPort) + ";lr>"
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	sess, err := caller.dcc.Invite(ctx, mustURI(t, "sip:"+plainAddr), []byte(testSDP),
-		sip.NewHeader("Route", route))
-	if err != nil {
-		t.Fatalf("caller invite: %v", err)
-	}
-	if err := sess.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
-		t.Fatalf("WaitAnswer: %v", err)
-	}
-	_ = sess.Ack(ctx)
-
-	// The sentinel address recovered from the forged token must never be contacted.
-	sentinel.noInvite(t, 300*time.Millisecond)
-}
+// NOTE: the former TestForgedRouteNotForwarded asserted that a token failing its HMAC
+// was never forwarded (no SSRF). The flow token is no longer signed (trusted-network
+// deployment, see Flow's security note in flowtoken.go), so that property — and its
+// test — no longer exist: any well-formed token is honored. Re-add both alongside the
+// MAC if this listener is ever exposed to untrusted clients.
 
 func mustURI(t *testing.T, s string) sip.Uri {
 	t.Helper()
