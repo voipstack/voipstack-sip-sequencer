@@ -140,6 +140,14 @@ func (c *Call) teardown(reason string) {
 		release()
 	}
 
+	// Deregister before the BYEs, not after: the call is logically dead the moment it
+	// commits to teardown, and the BYEs below are best-effort network round-trips that
+	// can block for seconds. In particular sipgo's BYE on an established-but-unconfirmed
+	// dialog (an ACK/BYE glare yielding "No ACK received") waits for the dialog to
+	// confirm or its INVITE transaction to time out. Removing first keeps the active-call
+	// registry/gauges honest and stops a glare from leaving a dead call lingering.
+	c.reg.remove(c.id, inboundDialogID)
+
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -155,6 +163,4 @@ func (c *Call) teardown(reason string) {
 	if transferTarget != nil {
 		_ = transferTarget.Bye(shutCtx)
 	}
-
-	c.reg.remove(c.id, inboundDialogID)
 }

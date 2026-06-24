@@ -133,6 +133,28 @@ whether it also receives the call's audio.
 | `next_hop.transport` | `udp` *(default)* \| `tcp` \| `tls`. `tls` requires a `tls_profile`.     |
 | `next_hop.tls_profile` | Name of a `tls_profiles` entry. Only valid when `transport: tls`.     |
 
+### Transport and the UDP path-MTU limit
+
+> **⚠️ Large requests over UDP are dropped — use `transport: tcp`.**
+
+Every outbound leg defaults to **UDP** (`sequence` apps and `next_hop` alike — see the
+`transport` fields above). Over UDP the sequencer enforces the conservative RFC 3261
+§18.1.1 path-MTU guard: a request larger than **1300 bytes** (`UDPMTUSize 1500 − 200`) is
+**refused at send** — `fail to write request … size of packet larger than MTU` — so the
+forward never leaves the host and the call cannot complete. **There is no automatic
+fallback to TCP yet.**
+
+This is easy to hit without any large/WebRTC SDP. A routine INVITE with a small SDP plus
+verbose headers (e.g. a FreeSWITCH INVITE carrying long `Allow` / `Allow-Events` /
+`Supported` / `Remote-Party-ID` lines) commonly lands at 1300–1600 bytes — already over
+the guard, even though it would fit a real 1500-byte Ethernet frame.
+
+**Mitigation:** set `transport: tcp` on any `next_hop` or `sequence` app that may carry
+large requests; a UDP-only peer must be able to accept TCP on the same port (RFC 3261
+§18.2.1). A rejected forward is logged with the full message and its byte size at `error`
+(`proxy forward failed … bytes=… size of packet larger than MTU`), so the cause is
+visible in the logs.
+
 ### Timeouts
 
 | Field         | Meaning                                                                 |
@@ -359,7 +381,7 @@ If you ever want to bypass the sequencer, point the UAC back to `:5060`. FreeSWI
 
 Current constraints and features not yet supported. See [PRD.md §8](PRD.md) for the full non-goals list.
 
-- **Transport:** Inbound listener is UDP. Application legs always use TCP (so large SDP offers are not capped by the UDP MTU guard); the next-hop leg is UDP by default and can opt into TCP via `transport: tcp`. TLS is **config-only** so far — `transport: tls` and `tls.listen` parse and validate but do not yet establish TLS (runtime is US13–16). No WebSocket.
+- **Transport:** Inbound listener co-binds **UDP and TCP** on `sip.listen` (RFC 3261), so endpoints can register/call over either. Outbound legs (`sequence` apps and `next_hop`) default to UDP and can opt into TCP via `transport: tcp`. **⚠️ Over UDP, a request larger than ~1300 bytes is rejected at send (`size of packet larger than MTU`) with no automatic TCP fallback — use `transport: tcp` for any peer that may carry large INVITEs. See [Transport and the UDP path-MTU limit](#transport-and-the-udp-path-mtu-limit).** TLS is **config-only** so far — `transport: tls` and `tls.listen` parse and validate but do not yet establish TLS (runtime is US13–16). No WebSocket.
 - **Media security:** Plain RTP only. No SIPS, SIP over TLS, or SRTP.
 - **NAT traversal:** No STUN, TURN, ICE, or hole-punching for SIP or RTP.
 - **Sequencing:** Static linear sequence only. No branching, looping, or dynamic routing.

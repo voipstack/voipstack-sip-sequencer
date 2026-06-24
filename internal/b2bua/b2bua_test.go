@@ -197,17 +197,49 @@ func listenSamePort(t *testing.T) (net.PacketConn, net.Listener) {
 	return nil, nil
 }
 
-// freeAddr grabs a UDP port and releases it for the engine to bind.
-// There is a small TOCTOU race; acceptable in test contexts.
+// freeAddr grabs an ephemeral 127.0.0.1 port free for BOTH udp and tcp — the engine
+// co-binds both on sip.listen — and releases it for the engine to bind, retrying on a
+// port taken on either side. A small TOCTOU race remains; acceptable in test contexts.
 func freeAddr(t *testing.T) string {
 	t.Helper()
-	l, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("freeAddr: %v", err)
+	for attempt := 0; attempt < 20; attempt++ {
+		l, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("freeAddr udp: %v", err)
+		}
+		addr := l.LocalAddr().String()
+		tl, err := net.Listen("tcp", addr)
+		if err != nil {
+			l.Close() // tcp side busy; try a fresh port
+			continue
+		}
+		tl.Close()
+		l.Close()
+		return addr
 	}
-	addr := l.LocalAddr().String()
-	l.Close()
-	return addr
+	t.Fatal("freeAddr: no free udp+tcp port after 20 attempts")
+	return ""
+}
+
+// waitNoActiveCalls polls until the engine's call registry is empty, failing if it is
+// not within a generous timeout. teardown is asynchronous — it BYEs every live leg
+// (network round-trips, each with its own timeout) before removing the call from the
+// registry — so a fixed sleep races that cleanup and flakes under load. Polling for the
+// real end state still fails for a genuine leak; it only tolerates a slow teardown.
+func waitNoActiveCalls(t *testing.T, eng *Engine, what string) {
+	t.Helper()
+	const timeout = 3 * time.Second
+	deadline := time.After(timeout)
+	for {
+		if eng.calls.len() == 0 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected 0 active calls %s, still %d after %s", what, eng.calls.len(), timeout)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 func testConfig(listenAddr, appURI, pbxURI string) config.Config {
@@ -238,33 +270,67 @@ func startEngine(t *testing.T, cfg config.Config, legTimeout time.Duration, sink
 		eng.metrics = sinks[0]
 	}
 
-	ready := make(chan struct{}, 1)
+	waitEngineReady(t, eng, cfg)
+	return eng
+}
+
+// expectedListeners is how many ListenAndServe ready callbacks the engine fires for cfg.
+// udp + tcp are always co-bound on sip.listen; ws/wss are optional and each fire it.
+// tls.listen uses a separate serveTLS path that does NOT fire the callback (its
+// readiness is checked with waitPortOpen), so it is not counted here.
+func expectedListeners(cfg config.Config) int {
+	n := 2 // udp + tcp on sip.listen
+	if cfg.WS.Listen != "" {
+		n++
+	}
+	if cfg.WSS.Listen != "" {
+		n++
+	}
+	return n
+}
+
+// waitEngineReady runs eng and blocks until every ListenAndServe listener has fired its
+// ready callback (one per listener), registering Cleanup. Waiting for all of them — not
+// just the first — keeps Cleanup's cancel from racing a listener still storing its closer
+// inside sipgo, and ensures co-bound transports (e.g. tcp) are actually bound.
+func waitEngineReady(t *testing.T, eng *Engine, cfg config.Config) {
+	t.Helper()
+	expected := expectedListeners(cfg)
+	ready := make(chan struct{}, expected)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
 		rctx := context.WithValue(ctx, sipgo.ListenReadyCtxKey,
-			sipgo.ListenReadyFuncCtxValue(func(_, _ string) { close(ready) }))
+			sipgo.ListenReadyFuncCtxValue(func(_, _ string) { ready <- struct{}{} }))
 		_ = eng.Run(rctx)
 	}()
 
-	select {
-	case <-ready:
-	case <-time.After(5 * time.Second):
-		cancel()
-		t.Fatal("engine did not start in time")
+	deadline := time.After(30 * time.Second)
+	for i := 0; i < expected; i++ {
+		select {
+		case <-ready:
+		case <-deadline:
+			cancel()
+			t.Fatal("engine did not start in time")
+		}
 	}
 
 	t.Cleanup(func() {
 		cancel()
 		_ = eng.Shutdown()
 	})
-
-	return eng
 }
 
 // waitDialogEnd blocks until the dialog transitions to DialogStateEnded or times out.
 func waitDialogEnd(t *testing.T, ch <-chan sip.DialogState, timeout time.Duration) {
 	t.Helper()
+	// The timeout only bounds a genuine hang — the happy path returns as soon as the
+	// Ended state arrives. Under parallel test load the teardown BYE round-trip that
+	// drives that transition can take several seconds, so enforce a generous floor to
+	// avoid spurious "timeout waiting for dialog end" flakes (callers pass 3s).
+	if timeout < 15*time.Second {
+		timeout = 15 * time.Second
+	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	for {
@@ -379,11 +445,7 @@ func TestCallerHangupTearsDownAllLegs(t *testing.T) {
 	waitDialogEnd(t, appEnd, 3*time.Second)
 	waitDialogEnd(t, pbxEnd, 3*time.Second)
 
-	// Give teardown a moment to remove from registry
-	time.Sleep(50 * time.Millisecond)
-	if n := eng.calls.len(); n != 0 {
-		t.Fatalf("expected 0 active calls after BYE, got %d", n)
-	}
+	waitNoActiveCalls(t, eng, "after BYE")
 }
 
 // Given established call; When PBX sends BYE; Then all legs tear down (AC3).
@@ -437,10 +499,7 @@ func TestCalleeHangupTearsDownAllLegs(t *testing.T) {
 	waitDialogEnd(t, callerEnd, 3*time.Second)
 	waitDialogEnd(t, appEnd, 3*time.Second)
 
-	time.Sleep(50 * time.Millisecond)
-	if n := eng.calls.len(); n != 0 {
-		t.Fatalf("expected 0 active calls after callee BYE, got %d", n)
-	}
+	waitNoActiveCalls(t, eng, "after callee BYE")
 }
 
 // Given app rejects with 486; When caller sends INVITE; Then caller sees 486 and PBX is never invited (AC4).
@@ -655,12 +714,7 @@ func TestManyRejectedCallsLeaveNoActiveCalls(t *testing.T) {
 		}
 	}
 
-	// Small settle window for teardown goroutines
-	time.Sleep(100 * time.Millisecond)
-
-	if n := eng.calls.len(); n != 0 {
-		t.Fatalf("expected empty registry, got %d active calls", n)
-	}
+	waitNoActiveCalls(t, eng, "(empty registry expected)")
 	// PBX should never have been invited
 	pbx.noInvite(t, 50*time.Millisecond)
 }
@@ -1044,10 +1098,7 @@ func TestFullChainTearsDownOnHangup(t *testing.T) {
 	waitDialogEnd(t, appCEnd, 3*time.Second)
 	waitDialogEnd(t, pbxEnd, 3*time.Second)
 
-	time.Sleep(50 * time.Millisecond)
-	if n := eng.calls.len(); n != 0 {
-		t.Fatalf("expected 0 active calls after BYE, got %d", n)
-	}
+	waitNoActiveCalls(t, eng, "after BYE")
 }
 
 // Given sequence [A,B,C]; When app B rejects; Then caller sees rejection, A is torn down,
@@ -1093,10 +1144,7 @@ func TestMidChainFailureTearsDownPriorLegs(t *testing.T) {
 	appC.noInvite(t, 200*time.Millisecond)
 	pbx.noInvite(t, 50*time.Millisecond)
 
-	time.Sleep(100 * time.Millisecond)
-	if n := eng.calls.len(); n != 0 {
-		t.Fatalf("expected 0 active calls after mid-chain failure, got %d", n)
-	}
+	waitNoActiveCalls(t, eng, "after mid-chain failure")
 }
 
 // ── failure-policy test helpers ───────────────────────────────────────────────
@@ -1400,8 +1448,5 @@ func TestSkipFailedLegNotInTeardown(t *testing.T) {
 		t.Fatalf("caller BYE: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-	if n := eng.calls.len(); n != 0 {
-		t.Fatalf("expected 0 active calls after BYE, got %d", n)
-	}
+	waitNoActiveCalls(t, eng, "after BYE")
 }

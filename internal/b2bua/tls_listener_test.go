@@ -151,28 +151,10 @@ func startEngineTLS(t *testing.T, cfg config.Config) *Engine {
 		t.Fatalf("new engine: %v", err)
 	}
 
-	ready := make(chan struct{}, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		rctx := context.WithValue(ctx, sipgo.ListenReadyCtxKey,
-			sipgo.ListenReadyFuncCtxValue(func(_, _ string) { close(ready) }))
-		_ = eng.Run(rctx)
-	}()
-
-	select {
-	case <-ready:
-	case <-time.After(5 * time.Second):
-		cancel()
-		t.Fatal("engine did not start in time")
-	}
+	waitEngineReady(t, eng, cfg)
 	if cfg.TLS.Listen != "" {
 		waitPortOpen(t, cfg.TLS.Listen)
 	}
-
-	t.Cleanup(func() {
-		cancel()
-		_ = eng.Shutdown()
-	})
 	return eng
 }
 
