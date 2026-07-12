@@ -22,6 +22,17 @@ sequence:
     media: tap                # tap = fork both directions to the app; none = inactive audio
     on_failure: skip          # skip = continue the chain on failure; abort = drop the call
     timeout: 5s               # optional per-app setup deadline (dial + answer); on expiry on_failure applies. Omit to use leg_timeout
+    # routing:               # optional: filter which calls this app receives (AND of from/to/method; omit to receive all calls)
+    #   from: "^sip:alice@"    # regex over the inbound From URI
+    #   to: "^sip:support@"    # regex over the inbound To URI
+    #   method: INVITE         # SIP method, case-insensitive; a non-matching app is skipped (not failed)
+  - name: route-guard          # a second app illustrating a routing rule
+    uri: sip:guard@127.0.0.1:6060
+    on_failure: abort
+    media: none
+    routing:
+      from: "^sip:alice@"        # only route calls from alice to this app
+      method: INVITE             # only INVITE (case-insensitive)
 
 leg_timeout: 32s              # global default leg answer/setup timeout (apps without timeout, next hop, mid-call, REFER); omit for 32s
 
