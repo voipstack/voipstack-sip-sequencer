@@ -104,6 +104,10 @@ sequence:                       # ordered application chain — list order IS ch
     uri: sip:guard.internal:5060
     on_failure: abort
     media: none
+    routing:                    # filter which calls this app receives (AND of fields; omit to receive all)
+      from: "^sip:alice@"        # regex over the inbound From URI
+      to: "^sip:support@"        # regex over the inbound To URI
+      method: INVITE             # SIP method, case-insensitive (e.g. invite | INVITE)
 ```
 
 > **Breaking change:** `next_hop` is now an **object** (`uri` + optional
@@ -120,6 +124,7 @@ sequence:                       # ordered application chain — list order IS ch
 | `media`      | `tap` — app receives a fork of the call audio (stereo, recvonly). `none` *(default)* — no media (audio `inactive`). |
 | `transport`  | `udp` *(default)* \| `tcp` \| `tls`. `tls` requires a `tls_profile` naming an entry in `tls_profiles`. |
 | `timeout`    | Go duration (e.g. `5s`) bounding this app's leg setup (dial + answer). On expiry the leg fails and `on_failure` applies. **Default: `leg_timeout`.** Must be `> 0` if set. |
+| `routing`    | Optional block filtering which calls this app receives. `from`/`to` are regexes over the inbound From/To URI strings; `method` is matched case-insensitively. All specified fields are AND-ed; an absent field is a wildcard. **Default: omitted → receives all calls.** Invalid regexes fail at startup. A non-matching app is skipped (not failed); the call continues to the next app and the PBX. |
 
 **Signaling vs media are orthogonal.** Every app is inserted into the SIP signaling
 chain in order (so it can accept/reject) regardless of `media`; `media` only controls
@@ -262,6 +267,7 @@ Tracked against the [user stories](requirements/).
 - B2BUA single-app bridge — inline, completes a call through one app (US2)
 - Ordered multi-app chain — sequence in YAML order, then PBX (US3)
 - Per-app failure handling — `abort` / `skip` (US4)
+- Per-app routing rules — regex over From/To + method, skip non-matching calls
 - RTP media anchoring — sequencer owns ports, rewrites SDP (US5)
 - Correlation ids — `X-Sequencer-Call-Id` / `X-Sequencer-Leg-Id` (US6)
 - Media fork to apps — `media: tap` stereo recvonly (US10)
