@@ -23,6 +23,20 @@ func withTransport(u sip.Uri, transport string) sip.Uri {
 	return u
 }
 
+// routingInput extracts the request fields a routing rule matches against: the SIP
+// method, the From URI string, and the To URI string. A missing From/To yields an
+// empty string, which a regex field can match (or not) as written.
+func routingInput(req *sip.Request) config.RoutingInput {
+	in := config.RoutingInput{Method: string(req.Method)}
+	if from := req.From(); from != nil {
+		in.From = from.Address.String()
+	}
+	if to := req.To(); to != nil {
+		in.To = to.Address.String()
+	}
+	return in
+}
+
 // dialContext bounds the dial — where sipgo performs the TCP+TLS connect — by the
 // profile's connect_timeout when one is set, so a dead TLS peer fails fast instead of
 // hanging the call. A zero timeout (or nil profile) leaves the dial unbounded. The
@@ -140,10 +154,11 @@ func (e *Engine) handleInvite(req *sip.Request, tx sip.ServerTransaction) {
 
 	callCtx, cancel := context.WithCancel(e.runCtx)
 	call := &Call{
-		id:     newCallID(),
-		state:  stateSetup,
-		cancel: cancel,
-		reg:    e.calls,
+		id:      newCallID(),
+		state:   stateSetup,
+		cancel:  cancel,
+		reg:     e.calls,
+		routing: routingInput(req),
 		inbound: InboundDialog{
 			session:  dss,
 			offerSDP: copyBody(req.Body()),
@@ -292,6 +307,11 @@ func (e *Engine) appLegFailed(app config.Application, stage string, hasTap bool,
 func (e *Engine) runAppChain(ctx context.Context, call *Call) bool {
 	for i := range e.cfg.Sequence {
 		app := e.cfg.Sequence[i]
+
+		if !app.RoutingRe.Matches(call.routing) {
+			slog.Info("application skipped by routing rule", "name", app.Name, "method", call.routing.Method, "from", call.routing.From, "to", call.routing.To)
+			continue
+		}
 
 		var appURI sip.Uri
 		if err := sip.ParseUri(app.URI, &appURI); err != nil {

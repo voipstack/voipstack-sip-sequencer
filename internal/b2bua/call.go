@@ -7,6 +7,8 @@ import (
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+
+	"github.com/voipstack/voipstack-sip-sequencer/internal/config"
 )
 
 // InboundDialog is the UAS (inbound) side of a call. It snapshots the inbound
@@ -44,6 +46,7 @@ type Call struct {
 	mu              sync.Mutex
 	state           CallState
 	inbound         InboundDialog
+	routing         config.RoutingInput
 	appLegs         []*OutboundLeg
 	pbxLeg          *OutboundLeg
 	transferTarget  *sipgo.DialogClientSession // set after a successful REFER transfer

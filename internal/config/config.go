@@ -153,6 +153,11 @@ type Observability struct {
 // Timeout is the optional per-app setup deadline (dial + answer wait) as a Go duration
 // string; an empty value falls back to the global LegTimeout. TimeoutDur is the resolved
 // value (zero means "use the global default").
+//
+// Routing optionally filters which inbound requests this app receives. A nil Routing
+// (the default) matches every request; a present block only routes requests whose
+// From/To/method satisfy all specified fields. RoutingRe holds the compiled, resolved
+// rule used at runtime.
 type Application struct {
 	Name       string              `yaml:"name"`
 	URI        string              `yaml:"uri"`
@@ -161,8 +166,10 @@ type Application struct {
 	Transport  Transport           `yaml:"transport"`
 	TLSProfile string              `yaml:"tls_profile"`
 	Timeout    string              `yaml:"timeout"`
+	Routing    *RoutingRule        `yaml:"routing"`
 	TimeoutDur time.Duration       `yaml:"-"`
 	Resolved   *ResolvedTLSProfile `yaml:"-"`
+	RoutingRe  *ResolvedRouting    `yaml:"-"`
 }
 
 // NextHop is the terminating hop, an object with a required uri and optional
@@ -250,6 +257,9 @@ func Parse(data []byte, source string) (Config, error) {
 		return Config{}, fmt.Errorf("parse config %q: %w", source, err)
 	}
 	if err := resolveTLS(&cfg); err != nil {
+		return Config{}, fmt.Errorf("parse config %q: %w", source, err)
+	}
+	if err := resolveRouting(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config %q: %w", source, err)
 	}
 	return cfg, nil
@@ -572,6 +582,21 @@ func resolveTLS(cfg *Config) error {
 			return err
 		}
 		cfg.NextHop.Resolved = r
+	}
+	return nil
+}
+
+// resolveRouting compiles each application's routing rule into a ResolvedRouting so
+// the bridge can match inbound requests without recompiling per call. A nil rule
+// yields a nil ResolvedRouting (matches everything); an invalid regex aborts load.
+func resolveRouting(cfg *Config) error {
+	for i := range cfg.Sequence {
+		app := &cfg.Sequence[i]
+		re, err := resolveRoutingRule(app.Routing)
+		if err != nil {
+			return fmt.Errorf("sequence[%d] %q: %w", i, app.Name, err)
+		}
+		app.RoutingRe = re
 	}
 	return nil
 }
